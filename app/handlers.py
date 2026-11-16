@@ -37,7 +37,13 @@ MAX_NAME_LENGTH = 200
 MAX_AUDIO_SIZE = 20 * 1024 * 1024  # 20 MB
 TELEGRAM_CAPTION_LIMIT = 1024
 
+# ============================================================================
+# PREMIUM TELEGRAM CUSTOM EMOJI
+# ============================================================================
 
+PREMIUM_PARTY_EMOJI = (
+    '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
+)
 # ============================================================================
 # FSM STATES
 # ============================================================================
@@ -984,7 +990,7 @@ async def set_group(message: Message) -> None:
 
 
 # ============================================================================
-# TEST BIRTHDAY NOTIFICATION
+# TEST BIRTHDAY NOTIFICATION — PREMIUM VERSION
 # ============================================================================
 
 @router.message(Command("testbirthday"))
@@ -993,17 +999,25 @@ async def test_birthday(message: Message, bot: Bot) -> None:
         return
 
     person_id = _parse_person_id(message, "testbirthday")
+
     if person_id is None:
         await message.answer(
-            "🎉 Foydalanish: <code>/testbirthday ID</code>",
+            "🎉 Foydalanish: <code>/testbirthday ID</code>\n\n"
+            "Masalan: <code>/testbirthday 5</code>",
             parse_mode="HTML",
         )
         return
 
+    # 1. Ma'lumotlarni bazadan olish
     async with SessionLocal() as session:
         person = await _get_active_person(session, person_id)
+
         if person is None:
-            await message.answer("❌ Faol inson topilmadi.")
+            await message.answer(
+                "❌ <b>Inson topilmadi.</b>\n\n"
+                "ID noto‘g‘ri yoki ushbu inson arxivlangan.",
+                parse_mode="HTML",
+            )
             return
 
         greeting = make_greeting(person, local_today())
@@ -1012,6 +1026,7 @@ async def test_birthday(message: Message, bot: Bot) -> None:
         full_name = person.full_name
 
         group_id = settings.target_group_id
+
         if group_id is None:
             cfg = await session.scalar(
                 select(GroupConfig)
@@ -1020,16 +1035,39 @@ async def test_birthday(message: Message, bot: Bot) -> None:
             )
             group_id = cfg.chat_id if cfg else None
 
+    # 2. Guruhni tekshirish
     if group_id is None:
         await message.answer(
             "⚠️ <b>Eslatma guruhi sozlanmagan.</b>\n\n"
             "Oilaviy guruh ichida /setgroup yuboring yoki "
-            "TARGET_GROUP_ID sozlamasini belgilang.",
+            "<code>TARGET_GROUP_ID</code> sozlamasini belgilang.",
             parse_mode="HTML",
         )
         return
 
+    premium_emoji_sent = False
+    greeting_sent = False
+    music_sent = False
+    greeting_message_id = None
+
     try:
+        # 3. Animatsiyali Premium Custom Emoji
+        try:
+            await bot.send_message(
+                chat_id=group_id,
+                text=PREMIUM_PARTY_EMOJI,
+                parse_mode="HTML",
+            )
+            premium_emoji_sent = True
+
+        except TelegramAPIError:
+            logger.warning(
+                "Premium Custom Emoji yuborilmadi. "
+                "Asosiy tabrik davom ettiriladi.",
+                exc_info=True,
+            )
+
+        # 4. Asosiy tabrik
         if photo_file_id:
             if len(greeting) <= TELEGRAM_CAPTION_LIMIT:
                 sent = await bot.send_photo(
@@ -1043,66 +1081,86 @@ async def test_birthday(message: Message, bot: Bot) -> None:
                     chat_id=group_id,
                     photo=photo_file_id,
                 )
-                await _send_long_text_to_chat(bot, group_id, greeting)
+
+                await _send_long_text_to_chat(
+                    bot=bot,
+                    chat_id=group_id,
+                    text=greeting,
+                )
+
+            greeting_message_id = sent.message_id
+
         else:
             sent = await bot.send_message(
                 chat_id=group_id,
                 text=greeting,
                 parse_mode="HTML",
             )
+            greeting_message_id = sent.message_id
 
-        music_sent = False
+        greeting_sent = True
+
+        # 5. Tabrik musiqasi
         if music_file_id:
             await bot.send_audio(
                 chat_id=group_id,
                 audio=music_file_id,
-                caption=f"🎵 {_safe_name(full_name)} uchun tabrik musiqasi",
+                caption=(
+                    f"🎵 <b>{_safe_name(full_name)}</b> "
+                    "uchun tabrik musiqasi"
+                ),
                 parse_mode="HTML",
             )
             music_sent = True
 
     except TelegramForbiddenError:
+        logger.exception("Bot guruhga xabar yubora olmadi.")
+
         await message.answer(
-            "❌ Bot guruhga xabar yubora olmadi.\n"
-            "Bot guruhdan chiqarilgan yoki xabar yuborish huquqi yo‘q."
+            "❌ <b>Bot guruhga xabar yubora olmadi.</b>\n\n"
+            "Bot guruhdan chiqarilgan yoki xabar yuborish "
+            "huquqiga ega emas.",
+            parse_mode="HTML",
         )
         return
+
     except TelegramBadRequest as exc:
-        logger.exception("Test tabrigini yuborishda Telegram BadRequest")
+        logger.exception("Test tabrigida Telegram BadRequest.")
+
         await message.answer(
-            "❌ Telegram xabarni qabul qilmadi.\n"
+            "❌ <b>Telegram xabarni qabul qilmadi.</b>\n\n"
             f"<code>{_safe_name(str(exc)[:500])}</code>",
             parse_mode="HTML",
         )
         return
+
     except TelegramAPIError:
-        logger.exception("Test tabrigini yuborishda Telegram API xatosi")
+        logger.exception("Test tabrigida Telegram API xatosi.")
+
         await message.answer(
-            "❌ Telegram API bilan bog‘liq xatolik yuz berdi. Loglarni tekshiring."
+            "❌ <b>Telegram API bilan bog‘liq xatolik yuz berdi.</b>\n\n"
+            "Railway loglarini tekshiring.",
+            parse_mode="HTML",
         )
         return
 
+    # 6. Test natijasi
+    premium_status = "🟢 Yuborildi" if premium_emoji_sent else "🟡 Yuborilmadi"
+    greeting_status = "🟢 Yuborildi" if greeting_sent else "🔴 Yuborilmadi"
+    music_status = "🟢 Yuborildi" if music_sent else "⚪ Biriktirilmagan"
+
     result = (
-        "✅ <b>Test tabrigi yuborildi.</b>\n\n"
-        f"👤 Inson: <b>{_safe_name(full_name)}</b>\n"
-        f"🆔 Xabar ID: <code>{sent.message_id}</code>\n"
-        f"🎵 Musiqa: {'yuborildi' if music_sent else 'biriktirilmagan'}"
+        "✨ <b>PREMIUM TEST YAKUNLANDI</b>\n\n"
+        f"👤 Ism: <b>{_safe_name(full_name)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎉 Premium emoji: {premium_status}\n"
+        f"🎂 Asosiy tabrik: {greeting_status}\n"
+        f"🎵 Musiqa: {music_status}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Xabar ID: <code>{greeting_message_id}</code>"
     )
+
     await message.answer(result, parse_mode="HTML")
-
-
-async def _send_long_text_to_chat(bot: Bot, chat_id: int, text: str) -> None:
-    """Uzun tabrikni Telegram matn limitiga mos bo‘lib yuboradi."""
-    limit = 4000
-    remaining = text
-    while remaining:
-        chunk = remaining[:limit]
-        split_at = chunk.rfind("\n")
-        if split_at > limit // 2:
-            chunk = chunk[:split_at]
-        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
-        remaining = remaining[len(chunk):].lstrip("\n")
-
 
 # ============================================================================
 # STATUS
