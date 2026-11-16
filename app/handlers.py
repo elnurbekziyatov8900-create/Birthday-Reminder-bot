@@ -930,6 +930,30 @@ async def invalid_audio_input(message: Message) -> None:
         parse_mode="HTML",
     )
 
+# ============================================================================
+# GET TELEGRAM CHAT ID
+# ============================================================================
+
+@router.message(Command("chatid"))
+async def get_chat_id(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    if message.from_user.id not in settings.admin_ids:
+        await message.answer("⛔ Ushbu komanda faqat administrator uchun.")
+        return
+
+    chat_type = message.chat.type
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "Private chat"
+
+    await message.answer(
+        "🔎 <b>TELEGRAM CHAT MA'LUMOTLARI</b>\n\n"
+        f"👥 Nomi: <b>{_safe_name(chat_title)}</b>\n"
+        f"🆔 Chat ID: <code>{chat_id}</code>\n"
+        f"📌 Chat turi: <code>{chat_type}</code>",
+        parse_mode="HTML",
+    )
 
 # ============================================================================
 # GROUP CONFIGURATION
