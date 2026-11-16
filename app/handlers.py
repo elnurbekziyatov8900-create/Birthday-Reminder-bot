@@ -1,7 +1,13 @@
-from datetime import datetime
-from html import escape
+from __future__ import annotations
 
-from aiogram import Router, F, Bot
+import logging
+import mimetypes
+from datetime import date, datetime, timedelta, timezone
+from html import escape
+from typing import Any
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,22 +16,31 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import AuthUser, Person, GroupConfig
+from app.models import AuthUser, GroupConfig, Person
 from app.services import (
     age_on,
+    birthday_date_for_year,
     birthday_table,
+    days_until,
     list_people,
     local_today,
-    days_until,
+    make_greeting,
 )
 
+logger = logging.getLogger(__name__)
 router = Router()
 settings = get_settings()
 
+MAX_PASSWORD_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+MAX_NAME_LENGTH = 200
+MAX_AUDIO_SIZE = 20 * 1024 * 1024  # 20 MB
+TELEGRAM_CAPTION_LIMIT = 1024
 
-# ============================================================
+
+# ============================================================================
 # FSM STATES
-# ============================================================
+# ============================================================================
 
 class AuthStates(StatesGroup):
     waiting_password = State()
@@ -36,41 +51,51 @@ class AddStates(StatesGroup):
     birth_date = State()
 
 
-# ============================================================
+class EditStates(StatesGroup):
+    name = State()
+    birth_date = State()
+
+
+class MediaStates(StatesGroup):
+    waiting_photo = State()
+    waiting_audio = State()
+
+
+# ============================================================================
 # TEXTS
-# ============================================================
+# ============================================================================
 
 WELCOME_TEXT = (
     "🎂 <b>Family Birthday Assistant</b>\n\n"
     "Assalomu alaykum! 👋\n\n"
-    "Oilangiz uchun muhim sanalarni eslab qolish endi oson!\n\n"
-    "🔐 Botdan foydalanish uchun oilaviy kirish parolini yuboring."
+    "Oilangiz uchun muhim sanalarni eslab qolish endi oson.\n\n"
+    "🔐 Davom etish uchun kirish parolini yuboring.\n"
+    "Bekor qilish uchun /cancel."
 )
 
 AUTH_SUCCESS_TEXT = (
-    "✅ <b>Muvaffaqiyatli kirdingiz!</b>\n\n"
-    "🎉 Family Birthday Assistant xizmatiga xush kelibsiz!\n\n"
-    "Quyidagi komandalar orqali botni boshqarishingiz mumkin:\n\n"
-    "📋 /help — yordam va komandalar\n"
+    "✅ <b>Avtorizatsiya muvaffaqiyatli yakunlandi!</b>\n\n"
+    "Family Birthday Assistant xizmatiga xush kelibsiz.\n\n"
+    "📋 /help — barcha komandalar\n"
     "🎂 /birthdays — barcha tug‘ilgan kunlar\n"
     "🎉 /today — bugungi tug‘ilgan kunlar\n"
     "⏳ /next — eng yaqin tug‘ilgan kun\n"
     "📅 /upcoming — keyingi 30 kun\n"
     "➕ /add — yangi inson qo‘shish\n"
-    "📊 /status — bot holati"
+    "📊 /status — tizim holati"
 )
 
 HELP_TEXT = (
     "🎂 <b>Family Birthday Assistant</b>\n"
-    "<i>Komandalar qo‘llanmasi</i>\n\n"
+    "<i>Boshqaruv qo‘llanmasi</i>\n\n"
     "📅 <b>TUG‘ILGAN KUNLAR</b>\n"
-    "/birthdays — barcha tug‘ilgan kunlar\n"
+    "/birthdays — barcha faol tug‘ilgan kunlar\n"
     "/today — bugungi tug‘ilgan kunlar\n"
-    "/next — eng yaqin tug‘ilgan kun\n"
+    "/next — navbatdagi tug‘ilgan kun\n"
     "/upcoming — keyingi 30 kun ichidagi sanalar\n\n"
     "👤 <b>MA’LUMOTLARNI BOSHQARISH</b>\n"
     "/add — yangi inson qo‘shish\n"
-    "/edit ID — tahrirlash bo‘yicha yo‘riqnoma\n"
+    "/edit ID — inson ma’lumotlarini tahrirlash\n"
     "/delete ID — insonni arxivlash\n"
     "/setphoto ID — surat biriktirish\n"
     "/setmusic ID — musiqa biriktirish\n\n"
@@ -78,70 +103,93 @@ HELP_TEXT = (
     "/setgroup — joriy guruhni eslatma guruhi qilish\n"
     "/testbirthday ID — test tabrigini yuborish\n\n"
     "⚙️ <b>TIZIM</b>\n"
-    "/status — bot holati\n"
+    "/status — bot va ma’lumotlar bazasi holati\n"
     "/cancel — joriy amalni bekor qilish\n"
     "/help — ushbu qo‘llanma"
 )
 
 
-# ============================================================
-# AUTHORIZATION
-# ============================================================
+# ============================================================================
+# GENERAL HELPERS
+# ============================================================================
 
-def is_admin_id(user_id: int) -> bool:
-    """Foydalanuvchi ruxsat berilgan administrator ekanini tekshiradi."""
+def _safe_name(value: str) -> str:
+    return escape(value, quote=True)
+
+
+def _parse_person_id(message: Message, command: str) -> int | None:
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def _parse_birth_date(raw_value: str) -> date | None:
+    try:
+        parsed = datetime.strptime(raw_value.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+    if parsed.year < 1900 or parsed > local_today():
+        return None
+
+    return parsed
+
+
+def _normalize_datetime(value: datetime) -> datetime:
+    """DB'dan kelgan naive datetime qiymatini UTC deb talqin qiladi."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_private_admin(message: Message) -> bool:
+    return (
+        message.chat.type == "private"
+        and message.from_user is not None
+        and message.from_user.id in settings.admin_ids
+    )
+
+
+async def is_admin_id(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
 async def authorized(user_id: int) -> bool:
-    """Administrator autentifikatsiyadan o‘tganini tekshiradi."""
-    if not is_admin_id(user_id):
+    if user_id not in settings.admin_ids:
         return False
 
     async with SessionLocal() as session:
         user = await session.scalar(
-            select(AuthUser).where(
-                AuthUser.telegram_user_id == user_id
-            )
+            select(AuthUser).where(AuthUser.telegram_user_id == user_id)
         )
-
         return bool(user and user.is_authenticated)
 
 
 async def require_admin(message: Message) -> bool:
-    """Komandani bajarishdan oldin administrator huquqini tekshiradi."""
+    """Admin huquqi va shaxsiy avtorizatsiyani tekshiradi."""
     if message.chat.type != "private":
-        if not message.from_user or not await authorized(
-            message.from_user.id
-        ):
-            await message.answer(
-                "🔒 <b>Kirish cheklangan</b>\n\n"
-                "Iltimos, botni shaxsiy chatda ochib, "
-                "/start orqali tizimga kiring.",
-                parse_mode="HTML",
-            )
-            return False
-
-        return True
-
-    if not message.from_user:
-        await message.answer("❌ Foydalanuvchi aniqlanmadi.")
+        await message.answer(
+            "🔒 <b>Bu komanda shaxsiy chatda boshqariladi.</b>\n\n"
+            "Bot bilan shaxsiy chatga o‘ting va /start yuboring.",
+            parse_mode="HTML",
+        )
         return False
 
-    if not is_admin_id(message.from_user.id):
+    if not message.from_user or message.from_user.id not in settings.admin_ids:
         await message.answer(
-            "⛔ <b>Kirishga ruxsat yo‘q</b>\n\n"
-            "Ushbu bot faqat ruxsat berilgan "
-            "administratorlar uchun mo‘ljallangan.",
+            "⛔ <b>Kirishga ruxsat yo‘q.</b>",
             parse_mode="HTML",
         )
         return False
 
     if not await authorized(message.from_user.id):
         await message.answer(
-            "🔐 <b>Avtorizatsiya talab qilinadi</b>\n\n"
-            "Botdan foydalanish uchun shaxsiy chatda "
-            "/start yuboring.",
+            "🔐 Avval avtorizatsiyadan o‘ting: /start",
             parse_mode="HTML",
         )
         return False
@@ -149,90 +197,108 @@ async def require_admin(message: Message) -> bool:
     return True
 
 
-# ============================================================
-# START
-# ============================================================
+async def _get_active_person(session: Any, person_id: int) -> Person | None:
+    person = await session.get(Person, person_id)
+    if person is None or not person.is_active:
+        return None
+    return person
+
+
+async def _send_long_text(message: Message, text: str) -> None:
+    """Telegram matn limitidan oshgan javoblarni xavfsiz bo‘lib yuboradi."""
+    limit = 4000
+    if len(text) <= limit:
+        await message.answer(text, parse_mode="HTML")
+        return
+
+    remaining = text
+    while remaining:
+        chunk = remaining[:limit]
+        split_at = chunk.rfind("\n")
+        if split_at > limit // 2:
+            chunk = chunk[:split_at]
+        await message.answer(chunk, parse_mode="HTML")
+        remaining = remaining[len(chunk):].lstrip("\n")
+
+
+# ============================================================================
+# CANCEL — FSM handlerlardan oldin ro‘yxatdan o‘tkaziladi
+# ============================================================================
+
+@router.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    await state.clear()
+
+    if current_state is None:
+        response = "ℹ️ Hozir bekor qilinadigan faol jarayon mavjud emas."
+    else:
+        response = (
+            "↩️ <b>Joriy jarayon bekor qilindi.</b>\n\n"
+            "Davom etish uchun /help komandasidan foydalaning."
+        )
+
+    await message.answer(response, parse_mode="HTML")
+
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
 
 @router.message(Command("start"))
-async def start(message: Message, state: FSMContext):
+async def start(message: Message, state: FSMContext) -> None:
     if message.chat.type != "private":
         await message.answer(
-            "🔐 <b>Xavfsizlik xabari</b>\n\n"
-            "Iltimos, botni shaxsiy chatda ochib, "
-            "/start komandasini yuboring.",
-            parse_mode="HTML",
+            "🔐 Iltimos, botni shaxsiy chatda ochib, /start yuboring."
         )
         return
 
     if not message.from_user:
         return
 
-    if not is_admin_id(message.from_user.id):
+    user_id = message.from_user.id
+    if user_id not in settings.admin_ids:
+        await state.clear()
         await message.answer(
-            "⛔ <b>Kirishga ruxsat yo‘q</b>\n\n"
-            "Kechirasiz, siz ushbu botdan foydalanish "
-            "uchun ruxsat olmagansiz.",
+            "⛔ <b>Kirishga ruxsat yo‘q.</b>\n\n"
+            "Ushbu bot faqat ruxsat berilgan administrator uchun mo‘ljallangan.",
             parse_mode="HTML",
         )
         return
 
-    if await authorized(message.from_user.id):
+    if await authorized(user_id):
         await state.clear()
-
         await message.answer(
             "🎂 <b>Family Birthday Assistant</b>\n\n"
-            "Qayta xush kelibsiz! 👋\n\n"
-            "Bot ishlashga tayyor.\n"
-            "📋 Komandalar ro‘yxati: /help\n\n"
-            "🎉 Yaqin tug‘ilgan kunlarni tekshirish: /upcoming",
+            "Qayta xush kelibsiz! Bot ishlashga tayyor.\n\n"
+            "📋 Komandalar: /help\n"
+            "📅 Yaqin sanalar: /upcoming",
             parse_mode="HTML",
         )
         return
 
     await state.set_state(AuthStates.waiting_password)
+    await message.answer(WELCOME_TEXT, parse_mode="HTML")
 
-    await message.answer(
-        WELCOME_TEXT,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# PASSWORD INPUT
-# ============================================================
 
 @router.message(AuthStates.waiting_password, F.text)
-async def password_input(message: Message, state: FSMContext):
-    if not message.from_user:
-        return
-
-    if not is_admin_id(message.from_user.id):
+async def password_input(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id not in settings.admin_ids:
         await state.clear()
         return
 
-    password = (message.text or "").strip()
+    raw_password = (message.text or "").strip()
 
-    # Parol Telegram chatida saqlanib qolmasligi uchun
-    # foydalanuvchi yuborgan xabarni o‘chirishga harakat qilamiz.
+    # Maxfiy parol Telegram chat tarixida qolmasligi uchun o‘chirishga urinamiz.
     try:
         await message.delete()
-    except Exception:
-        pass
+    except TelegramAPIError:
+        logger.debug("Parol xabarini o‘chirish imkoni bo‘lmadi.")
 
-    # Kutish holatida komandalar parol sifatida qabul qilinmasin.
-    if password.startswith("/"):
-        if password.split()[0].split("@")[0] == "/cancel":
-            await state.clear()
-            await message.answer(
-                "↩️ Kirish jarayoni bekor qilindi.\n\n"
-                "Qayta boshlash uchun /start yuboring."
-            )
-            return
-
+    if raw_password.startswith("/"):
         await message.answer(
-            "🔐 <b>Parol kutilmoqda</b>\n\n"
-            "Iltimos, kirish parolini yuboring.\n"
-            "Bekor qilish uchun /cancel yuboring.",
+            "🔐 <b>Parol kutilmoqda.</b>\n"
+            "Parolni yuboring yoki /cancel orqali jarayonni bekor qiling.",
             parse_mode="HTML",
         )
         return
@@ -249,59 +315,80 @@ async def password_input(message: Message, state: FSMContext):
                 telegram_user_id=message.from_user.id,
                 is_authenticated=False,
                 role="admin",
+                failed_attempts=0,
             )
             session.add(user)
             await session.flush()
 
-        if password == settings.bot_access_password:
+        now = _now_utc()
+        if user.locked_until and _normalize_datetime(user.locked_until) > now:
+            remaining = _normalize_datetime(user.locked_until) - now
+            minutes = max(1, (int(remaining.total_seconds()) + 59) // 60)
+            await message.answer(
+                "🔒 <b>Kirish vaqtincha bloklangan.</b>\n\n"
+                f"Qayta urinish uchun taxminan <b>{minutes} daqiqa</b> kuting.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Muddati tugagan blokni tozalash.
+        if user.locked_until:
+            user.locked_until = None
+            user.failed_attempts = 0
+
+        if raw_password == settings.bot_access_password:
             user.is_authenticated = True
             user.failed_attempts = 0
-            user.last_authenticated_at = datetime.utcnow()
-
+            user.locked_until = None
+            user.last_authenticated_at = now
             await session.commit()
             await state.clear()
+            await message.answer(AUTH_SUCCESS_TEXT, parse_mode="HTML")
+            return
 
-            await message.answer(
-                AUTH_SUCCESS_TEXT,
-                parse_mode="HTML",
-            )
+        user.is_authenticated = False
+        user.failed_attempts = (user.failed_attempts or 0) + 1
+        attempts = user.failed_attempts
 
-        else:
-            user.failed_attempts += 1
-            attempts = user.failed_attempts
-
+        if attempts >= MAX_PASSWORD_ATTEMPTS:
+            user.locked_until = now + timedelta(minutes=LOCKOUT_MINUTES)
             await session.commit()
-
+            await state.clear()
             await message.answer(
-                "❌ <b>Parol noto‘g‘ri</b>\n\n"
-                "Iltimos, parolni tekshirib, qayta urinib ko‘ring.\n\n"
-                f"🔢 Noto‘g‘ri urinishlar: <b>{attempts}</b>\n\n"
-                "↩️ Bekor qilish: /cancel",
+                "🚫 <b>Kirish vaqtincha bloklandi.</b>\n\n"
+                f"{MAX_PASSWORD_ATTEMPTS} marta noto‘g‘ri parol kiritildi.\n"
+                f"⏳ {LOCKOUT_MINUTES} daqiqadan keyin qayta urinishingiz mumkin.",
                 parse_mode="HTML",
             )
+            return
+
+        await session.commit()
+        left = MAX_PASSWORD_ATTEMPTS - attempts
+        await message.answer(
+            "❌ <b>Parol noto‘g‘ri.</b>\n\n"
+            f"Qolgan urinishlar: <b>{left}</b>\n"
+            "Bekor qilish: /cancel",
+            parse_mode="HTML",
+        )
 
 
-# ============================================================
+# ============================================================================
 # HELP
-# ============================================================
+# ============================================================================
 
 @router.message(Command("help"))
-async def help_command(message: Message):
+async def help_command(message: Message) -> None:
     if not await require_admin(message):
         return
-
-    await message.answer(
-        HELP_TEXT,
-        parse_mode="HTML",
-    )
+    await message.answer(HELP_TEXT, parse_mode="HTML")
 
 
-# ============================================================
-# ALL BIRTHDAYS
-# ============================================================
+# ============================================================================
+# BIRTHDAY QUERIES
+# ============================================================================
 
 @router.message(Command("birthdays"))
-async def birthdays(message: Message):
+async def birthdays_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
@@ -310,91 +397,59 @@ async def birthdays(message: Message):
 
     if not people:
         await message.answer(
-            "📭 <b>Hozircha tug‘ilgan kunlar yo‘q</b>\n\n"
-            "Yangi inson qo‘shish uchun /add komandasidan foydalaning.",
+            "📭 <b>Hozircha faol tug‘ilgan kunlar mavjud emas.</b>\n"
+            "Yangi inson qo‘shish: /add",
             parse_mode="HTML",
         )
         return
 
-    await message.answer(
-        birthday_table(people, local_today()),
-        parse_mode="HTML",
-    )
+    await _send_long_text(message, birthday_table(people, local_today()))
 
-
-# ============================================================
-# TODAY'S BIRTHDAYS
-# ============================================================
 
 @router.message(Command("today"))
-async def today_command(message: Message):
+async def today_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
     today = local_today()
-
     async with SessionLocal() as session:
         people = await list_people(session)
 
     found = [
-        person
-        for person in people
-        if (
-            person.birth_date.month,
-            person.birth_date.day,
-        ) == (
-            today.month,
-            today.day,
-        )
+        person for person in people
+        if birthday_date_for_year(person.birth_date, today.year) == today
     ]
 
     if not found:
         await message.answer(
             "🎉 <b>Bugungi tug‘ilgan kunlar</b>\n\n"
-            "Bugun bazada tug‘ilgan kuni bo‘lgan "
-            "inson topilmadi.\n\n"
-            "Yangi kun — yangi quvonch! 💛",
+            "Bugun bazada tug‘ilgan kuni bo‘lgan inson topilmadi. 💛",
             parse_mode="HTML",
         )
         return
 
-    lines = [
-        "🎉 <b>Bugungi tug‘ilgan kunlar</b>\n"
-    ]
-
+    lines = ["🎉 <b>Bugungi tug‘ilgan kunlar</b>\n"]
     for person in found:
-        name = escape(person.full_name)
-        age = age_on(person.birth_date, today)
-
         lines.append(
-            f"🎂 <b>{name}</b> — {age} yosh"
+            f"🎂 <b>{_safe_name(person.full_name)}</b> — "
+            f"{age_on(person.birth_date, today)} yosh"
         )
 
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-    )
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
-
-# ============================================================
-# NEXT BIRTHDAY
-# ============================================================
 
 @router.message(Command("next"))
-async def next_command(message: Message):
+async def next_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
     today = local_today()
-
     async with SessionLocal() as session:
         people = await list_people(session)
 
     if not people:
         await message.answer(
-            "📭 <b>Bazada ma’lumot yo‘q</b>\n\n"
-            "Yangi inson qo‘shish uchun /add yuboring.",
-            parse_mode="HTML",
+            "📭 Bazada faol insonlar yo‘q. Yangi inson qo‘shish: /add"
         )
         return
 
@@ -405,8 +460,6 @@ async def next_command(message: Message):
             item.full_name.casefold(),
         ),
     )
-
-    name = escape(person.full_name)
     remaining = days_until(person.birth_date, today)
 
     if remaining == 0:
@@ -414,37 +467,31 @@ async def next_command(message: Message):
     elif remaining == 1:
         countdown = "⏳ Ertaga!"
     else:
-        countdown = f"⏳ {remaining} kun qoldi"
+        countdown = f"⏳ {remaining} kun qoldi."
 
     await message.answer(
         "🎂 <b>Eng yaqin tug‘ilgan kun</b>\n\n"
-        f"👤 Ism: <b>{name}</b>\n"
-        f"📅 Tug‘ilgan sana: {person.birth_date:%d.%m.%Y}\n"
+        f"👤 Ism: <b>{_safe_name(person.full_name)}</b>\n"
+        f"📅 Sana: <code>{person.birth_date:%d.%m.%Y}</code>\n"
         f"{countdown}",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# UPCOMING BIRTHDAYS
-# ============================================================
-
 @router.message(Command("upcoming"))
-async def upcoming(message: Message):
+async def upcoming_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
     today = local_today()
-
     async with SessionLocal() as session:
         people = await list_people(session)
 
     found = sorted(
-        [
-            person
-            for person in people
-            if days_until(person.birth_date, today) <= 30
-        ],
+        (
+            person for person in people
+            if 0 <= days_until(person.birth_date, today) <= 30
+        ),
         key=lambda person: (
             days_until(person.birth_date, today),
             person.full_name.casefold(),
@@ -453,569 +500,639 @@ async def upcoming(message: Message):
 
     if not found:
         await message.answer(
-            "📅 <b>Yaqinlashayotgan tug‘ilgan kunlar</b>\n\n"
-            "Keyingi 30 kun ichida tug‘ilgan kuni "
-            "bo‘lgan inson topilmadi.",
+            "📅 <b>Keyingi 30 kun</b>\n\n"
+            "Ushbu davr ichida tug‘ilgan kuni bo‘lgan inson topilmadi.",
             parse_mode="HTML",
         )
         return
 
-    await message.answer(
-        "📅 <b>Keyingi 30 kun ichidagi tug‘ilgan kunlar</b>\n\n"
-        + birthday_table(found, today),
-        parse_mode="HTML",
-    )
+    table = birthday_table(found, today)
+    await _send_long_text(message, table)
 
 
-# ============================================================
-# ADD PERSON — START
-# ============================================================
+# ============================================================================
+# ADD PERSON
+# ============================================================================
 
 @router.message(Command("add"))
-async def add_start(message: Message, state: FSMContext):
+async def add_start(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
+    await state.clear()
     await state.set_state(AddStates.name)
-
     await message.answer(
         "➕ <b>Yangi inson qo‘shish</b>\n\n"
-        "1️⃣ Insonning to‘liq ismini kiriting.\n\n"
+        "To‘liq ismni kiriting.\n"
         "Masalan: <i>Ali Valiyev</i>\n\n"
-        "Bekor qilish uchun /cancel yuboring.",
+        "Bekor qilish: /cancel",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# ADD PERSON — NAME
-# ============================================================
-
 @router.message(AddStates.name, F.text)
-async def add_name(message: Message, state: FSMContext):
+async def add_name(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
     name = (message.text or "").strip()
-
     if name.startswith("/"):
         await message.answer(
-            "✏️ Iltimos, insonning to‘liq ismini kiriting.\n"
-            "Bekor qilish uchun /cancel yuboring."
+            "✏️ Iltimos, komanda emas, insonning to‘liq ismini kiriting."
         )
         return
 
-    if len(name) < 2 or len(name) > 200:
+    if not 2 <= len(name) <= MAX_NAME_LENGTH:
         await message.answer(
-            "⚠️ Ism 2–200 belgi oralig‘ida bo‘lishi kerak.\n\n"
-            "Iltimos, qayta kiriting."
+            f"⚠️ Ism uzunligi 2–{MAX_NAME_LENGTH} belgi oralig‘ida bo‘lishi kerak."
         )
         return
 
     await state.update_data(full_name=name)
     await state.set_state(AddStates.birth_date)
-
     await message.answer(
-        "📅 <b>Tug‘ilgan sanani kiriting</b>\n\n"
-        "Sanani <code>DD.MM.YYYY</code> formatida yuboring.\n\n"
+        "📅 Tug‘ilgan sanani <code>DD.MM.YYYY</code> formatida yuboring.\n"
         "Masalan: <code>25.10.2005</code>",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# ADD PERSON — BIRTH DATE
-# ============================================================
-
 @router.message(AddStates.birth_date, F.text)
-async def add_date(message: Message, state: FSMContext):
+async def add_birth_date(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
     raw_date = (message.text or "").strip()
-
     if raw_date.startswith("/"):
         await message.answer(
-            "📅 Tug‘ilgan sanani <code>DD.MM.YYYY</code> "
-            "formatida yuboring.\n"
-            "Bekor qilish uchun /cancel yuboring.",
+            "📅 Tug‘ilgan sanani <code>DD.MM.YYYY</code> formatida yuboring.",
             parse_mode="HTML",
         )
         return
 
-    try:
-        birth_date = datetime.strptime(
-            raw_date,
-            "%d.%m.%Y",
-        ).date()
-
-        if birth_date > local_today() or birth_date.year < 1900:
-            raise ValueError
-
-    except ValueError:
+    birth_date = _parse_birth_date(raw_date)
+    if birth_date is None:
         await message.answer(
-            "❌ <b>Sana noto‘g‘ri kiritildi</b>\n\n"
-            "Quyidagi formatdan foydalaning:\n"
-            "<code>DD.MM.YYYY</code>\n\n"
-            "Masalan: <code>25.10.2005</code>",
+            "❌ Sana noto‘g‘ri.\n"
+            "Format: <code>DD.MM.YYYY</code>\n"
+            "Sana 1900-yildan keyin va bugundan kech bo‘lmasligi kerak.",
             parse_mode="HTML",
         )
         return
 
     data = await state.get_data()
-    full_name = data["full_name"]
+    full_name = data.get("full_name")
+    if not full_name:
+        await state.clear()
+        await message.answer("⚠️ Jarayon holati yo‘qolgan. Qayta /add yuboring.")
+        return
 
     async with SessionLocal() as session:
-        person = Person(
-            full_name=full_name,
-            birth_date=birth_date,
-        )
-
+        person = Person(full_name=full_name, birth_date=birth_date)
         session.add(person)
         await session.commit()
         await session.refresh(person)
-
         person_id = person.id
 
     await state.clear()
-
-    safe_name = escape(full_name)
-
     await message.answer(
-        "✅ <b>Yangi inson muvaffaqiyatli qo‘shildi!</b>\n\n"
-        f"👤 Ism: <b>{safe_name}</b>\n"
+        "✅ <b>Inson muvaffaqiyatli qo‘shildi.</b>\n\n"
+        f"👤 Ism: <b>{_safe_name(full_name)}</b>\n"
         f"📅 Tug‘ilgan sana: <code>{birth_date:%d.%m.%Y}</code>\n"
         f"🆔 ID: <code>{person_id}</code>\n\n"
-        "🖼 Surat biriktirish:\n"
-        f"<code>/setphoto {person_id}</code>\n\n"
-        "🎵 Musiqa biriktirish:\n"
-        f"<code>/setmusic {person_id}</code>",
+        f"🖼 Surat: <code>/setphoto {person_id}</code>\n"
+        f"🎵 Musiqa: <code>/setmusic {person_id}</code>\n"
+        f"✏️ Tahrirlash: <code>/edit {person_id}</code>",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# DELETE PERSON
-# ============================================================
+# ============================================================================
+# EDIT PERSON
+# ============================================================================
 
-@router.message(Command("delete"))
-async def delete_person(message: Message):
+@router.message(Command("edit"))
+async def edit_start(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or not parts[1].isdigit():
+    person_id = _parse_person_id(message, "edit")
+    if person_id is None:
         await message.answer(
-            "🗑 <b>Insonni arxivlash</b>\n\n"
-            "Foydalanish:\n"
-            "<code>/delete ID</code>\n\n"
+            "✏️ Foydalanish: <code>/edit ID</code>\n"
+            "Masalan: <code>/edit 5</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    async with SessionLocal() as session:
+        person = await _get_active_person(session, person_id)
+        if person is None:
+            await message.answer("❌ Bunday faol ID topilmadi.")
+            return
+        current_name = person.full_name
+        current_date = person.birth_date
+
+    await state.clear()
+    await state.update_data(edit_person_id=person_id)
+    await state.set_state(EditStates.name)
+    await message.answer(
+        "✏️ <b>Ma’lumotlarni tahrirlash</b>\n\n"
+        f"Joriy ism: <b>{_safe_name(current_name)}</b>\n"
+        "Yangi ismni yuboring yoki o‘zgartirmaslik uchun <code>-</code> kiriting.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(EditStates.name, F.text)
+async def edit_name(message: Message, state: FSMContext) -> None:
+    if not await require_admin(message):
+        return
+
+    value = (message.text or "").strip()
+    if value.startswith("/"):
+        await message.answer("Ismni kiriting yoki /cancel yuboring.")
+        return
+    if value != "-" and not 2 <= len(value) <= MAX_NAME_LENGTH:
+        await message.answer(
+            f"Ism 2–{MAX_NAME_LENGTH} belgi oralig‘ida bo‘lishi kerak."
+        )
+        return
+
+    await state.update_data(new_full_name=None if value == "-" else value)
+    await state.set_state(EditStates.birth_date)
+    await message.answer(
+        "📅 Yangi tug‘ilgan sanani <code>DD.MM.YYYY</code> formatida kiriting.\n"
+        "O‘zgartirmaslik uchun <code>-</code> yuboring.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(EditStates.birth_date, F.text)
+async def edit_birth_date(message: Message, state: FSMContext) -> None:
+    if not await require_admin(message):
+        return
+
+    value = (message.text or "").strip()
+    if value.startswith("/"):
+        await message.answer("Sanani kiriting yoki /cancel yuboring.")
+        return
+
+    new_date: date | None = None
+    if value != "-":
+        new_date = _parse_birth_date(value)
+        if new_date is None:
+            await message.answer(
+                "❌ Sana noto‘g‘ri. <code>DD.MM.YYYY</code> formatidan foydalaning.",
+                parse_mode="HTML",
+            )
+            return
+
+    data = await state.get_data()
+    person_id = data.get("edit_person_id")
+    new_name = data.get("new_full_name")
+
+    async with SessionLocal() as session:
+        person = await _get_active_person(session, int(person_id or 0))
+        if person is None:
+            await state.clear()
+            await message.answer("❌ Inson topilmadi yoki arxivlangan.")
+            return
+
+        if new_name is not None:
+            person.full_name = new_name
+        if new_date is not None:
+            person.birth_date = new_date
+
+        await session.commit()
+        final_name = person.full_name
+        final_date = person.birth_date
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Ma’lumotlar yangilandi.</b>\n\n"
+        f"👤 Ism: <b>{_safe_name(final_name)}</b>\n"
+        f"📅 Tug‘ilgan sana: <code>{final_date:%d.%m.%Y}</code>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================================
+# ARCHIVE PERSON
+# ============================================================================
+
+@router.message(Command("delete"))
+async def delete_person(message: Message) -> None:
+    if not await require_admin(message):
+        return
+
+    person_id = _parse_person_id(message, "delete")
+    if person_id is None:
+        await message.answer(
+            "🗑 Foydalanish: <code>/delete ID</code>\n"
             "Masalan: <code>/delete 5</code>",
             parse_mode="HTML",
         )
         return
 
     async with SessionLocal() as session:
-        person = await session.get(Person, int(parts[1]))
-
-        if not person or not person.is_active:
-            await message.answer(
-                "❌ Bunday faol ID topilmadi.",
-            )
+        person = await _get_active_person(session, person_id)
+        if person is None:
+            await message.answer("❌ Bunday faol ID topilmadi.")
             return
 
         person.is_active = False
         await session.commit()
-
-        name = escape(person.full_name)
+        name = person.full_name
 
     await message.answer(
-        "✅ <b>Inson arxivlandi</b>\n\n"
-        f"👤 {name}\n\n"
-        "U faol tug‘ilgan kunlar ro‘yxatida "
-        "ko‘rinmasligi kerak.",
+        "✅ <b>Inson arxivlandi.</b>\n\n"
+        f"👤 {_safe_name(name)}\n"
+        "U faol ro‘yxat va kelgusi eslatmalarda qatnashmaydi.",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# EDIT PERSON
-# ============================================================
-
-@router.message(Command("edit"))
-async def edit_person(message: Message):
-    if not await require_admin(message):
-        return
-
-    await message.answer(
-        "✏️ <b>Ma’lumotlarni tahrirlash</b>\n\n"
-        "Ushbu versiyada tahrirlash dialogi "
-        "hali amalga oshirilmagan.\n\n"
-        "⚠️ Ma’lumotni o‘zgartirish uchun hozircha "
-        "o‘chirish yoki qayta qo‘shishdan oldin "
-        "ma’lumotlar bazasining zaxira nusxasini oling.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# SET PHOTO
-# ============================================================
+# ============================================================================
+# MEDIA ATTACHMENT
+# ============================================================================
 
 @router.message(Command("setphoto"))
-async def setphoto(message: Message, state: FSMContext):
+async def set_photo_start(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or not parts[1].isdigit():
+    person_id = _parse_person_id(message, "setphoto")
+    if person_id is None:
         await message.answer(
-            "🖼 <b>Surat biriktirish</b>\n\n"
-            "Foydalanish:\n"
-            "<code>/setphoto ID</code>\n\n"
-            "Masalan: <code>/setphoto 5</code>",
+            "🖼 Foydalanish: <code>/setphoto ID</code>",
             parse_mode="HTML",
         )
         return
 
-    person_id = int(parts[1])
-
     async with SessionLocal() as session:
-        person = await session.get(Person, person_id)
-
-        if not person or not person.is_active:
-            await message.answer(
-                "❌ Faol inson topilmadi.",
-            )
+        person = await _get_active_person(session, person_id)
+        if person is None:
+            await message.answer("❌ Faol inson topilmadi.")
             return
+        name = person.full_name
 
-    await state.update_data(
-        media_person_id=person_id,
-        media_type="photo",
-    )
-
+    await state.clear()
+    await state.update_data(media_person_id=person_id)
+    await state.set_state(MediaStates.waiting_photo)
     await message.answer(
-        "🖼 <b>Surat yuborish</b>\n\n"
-        "Endi shu chatga kerakli insonning suratini yuboring.\n\n"
+        f"🖼 <b>{_safe_name(name)}</b> uchun surat yuboring.\n\n"
         "Bekor qilish: /cancel",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# SET MUSIC
-# ============================================================
-
-@router.message(Command("setmusic"))
-async def setmusic(message: Message, state: FSMContext):
+@router.message(MediaStates.waiting_photo, F.photo)
+async def receive_photo(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
-        return
-
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer(
-            "🎵 <b>Musiqa biriktirish</b>\n\n"
-            "Foydalanish:\n"
-            "<code>/setmusic ID</code>\n\n"
-            "Masalan: <code>/setmusic 5</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    person_id = int(parts[1])
-
-    async with SessionLocal() as session:
-        person = await session.get(Person, person_id)
-
-        if not person or not person.is_active:
-            await message.answer(
-                "❌ Faol inson topilmadi.",
-            )
-            return
-
-    await state.update_data(
-        media_person_id=person_id,
-        media_type="audio",
-    )
-
-    await message.answer(
-        "🎵 <b>Musiqa yuborish</b>\n\n"
-        "Endi shu chatga audio yoki musiqa faylini yuboring.\n\n"
-        "Bekor qilish: /cancel",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# PHOTO UPLOAD
-# ============================================================
-
-@router.message(F.photo)
-async def photo_upload(message: Message, state: FSMContext):
-    if not message.from_user:
-        return
-
-    if not await authorized(message.from_user.id):
         return
 
     data = await state.get_data()
-
-    if data.get("media_type") != "photo":
+    person_id = data.get("media_person_id")
+    if not person_id:
+        await state.clear()
+        await message.answer("⚠️ Yuklash sessiyasi topilmadi. Qayta urinib ko‘ring.")
         return
 
-    person_id = data.get("media_person_id")
-
     async with SessionLocal() as session:
-        person = await session.get(Person, person_id)
-
-        if not person or not person.is_active:
+        person = await _get_active_person(session, int(person_id))
+        if person is None:
             await state.clear()
-            await message.answer(
-                "❌ Inson topilmadi yoki arxivlangan.",
-            )
+            await message.answer("❌ Inson topilmadi yoki arxivlangan.")
             return
 
         person.photo_file_id = message.photo[-1].file_id
         await session.commit()
-
-        name = escape(person.full_name)
+        name = person.full_name
 
     await state.clear()
-
     await message.answer(
-        "✅ <b>Surat saqlandi!</b>\n\n"
-        f"👤 Inson: {name}\n"
-        "🖼 Surat tug‘ilgan kun tabrigida "
-        "ishlatilishi mumkin.",
+        "✅ <b>Surat muvaffaqiyatli saqlandi.</b>\n"
+        f"👤 Inson: <b>{_safe_name(name)}</b>",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# AUDIO UPLOAD
-# ============================================================
-
-@router.message(F.audio | F.document)
-async def audio_upload(message: Message, state: FSMContext):
-    if not message.from_user:
-        return
-
-    if not await authorized(message.from_user.id):
-        return
-
-    data = await state.get_data()
-
-    if data.get("media_type") != "audio":
-        return
-
-    if message.audio:
-        file_id = message.audio.file_id
-    elif message.document:
-        file_id = message.document.file_id
-    else:
-        return
-
-    person_id = data.get("media_person_id")
-
-    async with SessionLocal() as session:
-        person = await session.get(Person, person_id)
-
-        if not person or not person.is_active:
-            await state.clear()
-            await message.answer(
-                "❌ Inson topilmadi yoki arxivlangan.",
-            )
-            return
-
-        person.music_file_id = file_id
-        await session.commit()
-
-        name = escape(person.full_name)
-
-    await state.clear()
-
+@router.message(MediaStates.waiting_photo)
+async def invalid_photo_input(message: Message) -> None:
     await message.answer(
-        "✅ <b>Audio saqlandi!</b>\n\n"
-        f"👤 Inson: {name}\n"
-        "🎵 Audio tug‘ilgan kun tabrigida "
-        "ishlatilishi mumkin.",
+        "⚠️ Iltimos, rasmni Telegram <b>photo</b> sifatida yuboring.\n"
+        "Bekor qilish: /cancel",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# SET REMINDER GROUP
-# ============================================================
-
-@router.message(Command("setgroup"))
-async def setgroup(message: Message):
+@router.message(Command("setmusic"))
+async def set_music_start(message: Message, state: FSMContext) -> None:
     if not await require_admin(message):
         return
 
-    if message.chat.type == "private":
+    person_id = _parse_person_id(message, "setmusic")
+    if person_id is None:
         await message.answer(
-            "👨‍👩‍👧‍👦 <b>Guruhni sozlash</b>\n\n"
-            "Avval botni oilaviy guruhga qo‘shing.\n"
-            "Keyin guruh ichida /setgroup komandasini yuboring.",
+            "🎵 Foydalanish: <code>/setmusic ID</code>",
             parse_mode="HTML",
         )
         return
 
     async with SessionLocal() as session:
-        cfg = await session.scalar(
-            select(GroupConfig).where(
-                GroupConfig.chat_id == message.chat.id
+        person = await _get_active_person(session, person_id)
+        if person is None:
+            await message.answer("❌ Faol inson topilmadi.")
+            return
+        name = person.full_name
+
+    await state.clear()
+    await state.update_data(media_person_id=person_id)
+    await state.set_state(MediaStates.waiting_audio)
+    await message.answer(
+        f"🎵 <b>{_safe_name(name)}</b> uchun audio yuboring.\n\n"
+        "Audio yoki audio formatdagi hujjat qabul qilinadi (20 MB gacha).\n"
+        "Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+
+
+@router.message(MediaStates.waiting_audio, F.audio | F.document)
+async def receive_audio(message: Message, state: FSMContext) -> None:
+    if not await require_admin(message):
+        return
+
+    file_id: str | None = None
+    file_size: int | None = None
+
+    if message.audio:
+        file_id = message.audio.file_id
+        file_size = message.audio.file_size
+    elif message.document:
+        document = message.document
+        mime_type = (document.mime_type or "").lower()
+        filename = (document.file_name or "").lower()
+        guessed_type = mimetypes.guess_type(filename)[0] or ""
+        if not (mime_type.startswith("audio/") or guessed_type.startswith("audio/")):
+            await message.answer(
+                "⚠️ Bu hujjat audio fayl emas. Audio formatdagi fayl yuboring."
             )
+            return
+        file_id = document.file_id
+        file_size = document.file_size
+
+    if not file_id:
+        await message.answer("❌ Audio faylni aniqlab bo‘lmadi.")
+        return
+
+    if file_size and file_size > MAX_AUDIO_SIZE:
+        await message.answer("⚠️ Audio hajmi 20 MB dan oshmasligi kerak.")
+        return
+
+    data = await state.get_data()
+    person_id = data.get("media_person_id")
+    if not person_id:
+        await state.clear()
+        await message.answer("⚠️ Yuklash sessiyasi topilmadi. Qayta urinib ko‘ring.")
+        return
+
+    async with SessionLocal() as session:
+        person = await _get_active_person(session, int(person_id))
+        if person is None:
+            await state.clear()
+            await message.answer("❌ Inson topilmadi yoki arxivlangan.")
+            return
+
+        person.music_file_id = file_id
+        await session.commit()
+        name = person.full_name
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Musiqa muvaffaqiyatli saqlandi.</b>\n"
+        f"👤 Inson: <b>{_safe_name(name)}</b>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(MediaStates.waiting_audio)
+async def invalid_audio_input(message: Message) -> None:
+    await message.answer(
+        "⚠️ Iltimos, audio yoki audio formatdagi hujjat yuboring.\n"
+        "Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================================
+# GROUP CONFIGURATION
+# ============================================================================
+
+@router.message(Command("setgroup"))
+async def set_group(message: Message) -> None:
+    if not message.from_user or message.from_user.id not in settings.admin_ids:
+        await message.answer("⛔ Ushbu amal faqat administrator uchun.")
+        return
+
+    if message.chat.type == "private":
+        if not await require_admin(message):
+            return
+        await message.answer(
+            "👨‍👩‍👧‍👦 Avval botni oilaviy guruhga qo‘shing.\n"
+            "So‘ngra o‘sha guruh ichida /setgroup yuboring."
+        )
+        return
+
+    # Guruh ichida ham adminning DB avtorizatsiyasini tekshiramiz.
+    if not await authorized(message.from_user.id):
+        await message.answer(
+            "🔐 Avval bot bilan shaxsiy chatda /start orqali avtorizatsiyadan o‘ting."
+        )
+        return
+
+    chat_title = message.chat.title or "Family group"
+    async with SessionLocal() as session:
+        cfg = await session.scalar(
+            select(GroupConfig).where(GroupConfig.chat_id == message.chat.id)
         )
 
         if cfg is None:
             cfg = GroupConfig(
                 chat_id=message.chat.id,
-                title=message.chat.title or "Family group",
+                title=chat_title,
                 timezone=settings.timezone,
                 reminder_time=settings.birthday_reminder_time,
+                is_active=True,
             )
             session.add(cfg)
         else:
+            cfg.title = chat_title
+            cfg.timezone = settings.timezone
+            cfg.reminder_time = settings.birthday_reminder_time
             cfg.is_active = True
 
         await session.commit()
 
     await message.answer(
-        "✅ <b>Guruh muvaffaqiyatli sozlandi!</b>\n\n"
-        f"👨‍👩‍👧‍👦 Guruh: {escape(message.chat.title or 'Family group')}\n"
-        f"🕘 Eslatma vaqti: {settings.birthday_reminder_time}\n"
-        f"🌍 Vaqt zonasi: {settings.timezone}",
+        "✅ <b>Guruh sozlamalari saqlandi.</b>\n\n"
+        f"👨‍👩‍👧‍👦 Guruh: <b>{_safe_name(chat_title)}</b>\n"
+        f"🕘 Eslatma vaqti: <code>{settings.birthday_reminder_time}</code>\n"
+        f"🌍 Vaqt zonasi: <code>{_safe_name(settings.timezone)}</code>",
         parse_mode="HTML",
     )
 
 
-# ============================================================
-# TEST BIRTHDAY
-# ============================================================
+# ============================================================================
+# TEST BIRTHDAY NOTIFICATION
+# ============================================================================
 
 @router.message(Command("testbirthday"))
-async def test_birthday(message: Message, bot: Bot):
+async def test_birthday(message: Message, bot: Bot) -> None:
     if not await require_admin(message):
         return
 
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or not parts[1].isdigit():
+    person_id = _parse_person_id(message, "testbirthday")
+    if person_id is None:
         await message.answer(
-            "🎉 <b>Test tabrigi</b>\n\n"
-            "Foydalanish:\n"
-            "<code>/testbirthday ID</code>\n\n"
-            "Masalan: <code>/testbirthday 5</code>",
+            "🎉 Foydalanish: <code>/testbirthday ID</code>",
             parse_mode="HTML",
         )
         return
 
     async with SessionLocal() as session:
-        person = await session.get(Person, int(parts[1]))
-
-        if not person or not person.is_active:
-            await message.answer(
-                "❌ Faol inson topilmadi.",
-            )
+        person = await _get_active_person(session, person_id)
+        if person is None:
+            await message.answer("❌ Faol inson topilmadi.")
             return
-
-        from app.services import make_greeting
 
         greeting = make_greeting(person, local_today())
-
-        group_id = settings.target_group_id
-
-        if not group_id:
-            cfg = await session.scalar(
-                select(GroupConfig).where(
-                    GroupConfig.is_active.is_(True)
-                )
-            )
-
-            if cfg:
-                group_id = cfg.chat_id
-
-        if not group_id:
-            await message.answer(
-                "⚠️ <b>Guruh sozlanmagan</b>\n\n"
-                "Oilaviy guruhda /setgroup komandasini yuboring "
-                "yoki TARGET_GROUP_ID sozlamasini tekshiring.",
-                parse_mode="HTML",
-            )
-            return
-
         photo_file_id = person.photo_file_id
         music_file_id = person.music_file_id
-        full_name = escape(person.full_name)
+        full_name = person.full_name
 
-    if photo_file_id:
-        sent = await bot.send_photo(
-            chat_id=group_id,
-            photo=photo_file_id,
-            caption=greeting,
+        group_id = settings.target_group_id
+        if group_id is None:
+            cfg = await session.scalar(
+                select(GroupConfig)
+                .where(GroupConfig.is_active.is_(True))
+                .order_by(GroupConfig.id.asc())
+            )
+            group_id = cfg.chat_id if cfg else None
+
+    if group_id is None:
+        await message.answer(
+            "⚠️ <b>Eslatma guruhi sozlanmagan.</b>\n\n"
+            "Oilaviy guruh ichida /setgroup yuboring yoki "
+            "TARGET_GROUP_ID sozlamasini belgilang.",
             parse_mode="HTML",
         )
-    else:
-        sent = await bot.send_message(
-            chat_id=group_id,
-            text=greeting,
+        return
+
+    try:
+        if photo_file_id:
+            if len(greeting) <= TELEGRAM_CAPTION_LIMIT:
+                sent = await bot.send_photo(
+                    chat_id=group_id,
+                    photo=photo_file_id,
+                    caption=greeting,
+                    parse_mode="HTML",
+                )
+            else:
+                sent = await bot.send_photo(
+                    chat_id=group_id,
+                    photo=photo_file_id,
+                )
+                await _send_long_text_to_chat(bot, group_id, greeting)
+        else:
+            sent = await bot.send_message(
+                chat_id=group_id,
+                text=greeting,
+                parse_mode="HTML",
+            )
+
+        music_sent = False
+        if music_file_id:
+            await bot.send_audio(
+                chat_id=group_id,
+                audio=music_file_id,
+                caption=f"🎵 {_safe_name(full_name)} uchun tabrik musiqasi",
+                parse_mode="HTML",
+            )
+            music_sent = True
+
+    except TelegramForbiddenError:
+        await message.answer(
+            "❌ Bot guruhga xabar yubora olmadi.\n"
+            "Bot guruhdan chiqarilgan yoki xabar yuborish huquqi yo‘q."
+        )
+        return
+    except TelegramBadRequest as exc:
+        logger.exception("Test tabrigini yuborishda Telegram BadRequest")
+        await message.answer(
+            "❌ Telegram xabarni qabul qilmadi.\n"
+            f"<code>{_safe_name(str(exc)[:500])}</code>",
             parse_mode="HTML",
         )
-
-    if music_file_id:
-        await bot.send_audio(
-            chat_id=group_id,
-            audio=music_file_id,
-            caption=f"🎵 {full_name} uchun tabrik musiqasi",
-            parse_mode="HTML",
+        return
+    except TelegramAPIError:
+        logger.exception("Test tabrigini yuborishda Telegram API xatosi")
+        await message.answer(
+            "❌ Telegram API bilan bog‘liq xatolik yuz berdi. Loglarni tekshiring."
         )
+        return
 
-    await message.answer(
-        "✅ <b>Test tabrigi yuborildi!</b>\n\n"
-        f"👤 Inson: {full_name}\n"
-        f"🆔 Xabar ID: <code>{sent.message_id}</code>",
-        parse_mode="HTML",
+    result = (
+        "✅ <b>Test tabrigi yuborildi.</b>\n\n"
+        f"👤 Inson: <b>{_safe_name(full_name)}</b>\n"
+        f"🆔 Xabar ID: <code>{sent.message_id}</code>\n"
+        f"🎵 Musiqa: {'yuborildi' if music_sent else 'biriktirilmagan'}"
     )
+    await message.answer(result, parse_mode="HTML")
 
 
-# ============================================================
-# BOT STATUS
-# ============================================================
+async def _send_long_text_to_chat(bot: Bot, chat_id: int, text: str) -> None:
+    """Uzun tabrikni Telegram matn limitiga mos bo‘lib yuboradi."""
+    limit = 4000
+    remaining = text
+    while remaining:
+        chunk = remaining[:limit]
+        split_at = chunk.rfind("\n")
+        if split_at > limit // 2:
+            chunk = chunk[:split_at]
+        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+        remaining = remaining[len(chunk):].lstrip("\n")
+
+
+# ============================================================================
+# STATUS
+# ============================================================================
 
 @router.message(Command("status"))
-async def status(message: Message):
+async def status_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
-    async with SessionLocal() as session:
-        people = await list_people(session)
+    try:
+        async with SessionLocal() as session:
+            people = await list_people(session)
+            active_count = len(people)
+    except Exception:
+        logger.exception("Ma’lumotlar bazasi holatini tekshirishda xato")
+        await message.answer(
+            "📊 <b>Bot holati</b>\n\n"
+            "🟢 Bot: ishlayapti\n"
+            "🔴 Ma’lumotlar bazasi: ulanishda xatolik",
+            parse_mode="HTML",
+        )
+        return
 
     await message.answer(
         "📊 <b>Bot holati</b>\n\n"
         "🟢 Bot: ishlayapti\n"
-        "🗄 Ma’lumotlar bazasi: ulandi\n"
-        f"👥 Faol insonlar: {len(people)}\n"
-        f"🕘 Eslatma vaqti: {settings.birthday_reminder_time}\n"
-        f"🌍 Vaqt zonasi: {settings.timezone}",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# CANCEL
-# ============================================================
-
-@router.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
-    await state.clear()
-
-    await message.answer(
-        "↩️ <b>Joriy amal bekor qilindi.</b>\n\n"
-        "Davom etish uchun kerakli komandani tanlang:\n"
-        "📋 /help — komandalar ro‘yxati\n"
-        "🎂 /birthdays — tug‘ilgan kunlar",
+        "🟢 Ma’lumotlar bazasi: ulandi\n"
+        f"👥 Faol insonlar: <b>{active_count}</b>\n"
+        f"🕘 Eslatma vaqti: <code>{settings.birthday_reminder_time}</code>\n"
+        f"🌍 Vaqt zonasi: <code>{_safe_name(settings.timezone)}</code>",
         parse_mode="HTML",
     )
