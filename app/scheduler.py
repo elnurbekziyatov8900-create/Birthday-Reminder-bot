@@ -1,4 +1,3 @@
-
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -8,7 +7,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import Person, NotificationLog, GroupConfig
+from app.models import NotificationLog, GroupConfig
 from app.services import (
     local_today,
     birthdays_today,
@@ -16,17 +15,30 @@ from app.services import (
     already_notified,
 )
 
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# PREMIUM CUSTOM EMOJI
+# ============================================================
+
+PREMIUM_PARTY_EMOJI = (
+    '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
+)
 
 
 async def send_daily_birthdays(bot) -> None:
     """
     Bugun tug‘ilgan kuni bo‘lgan insonlarga tabrik yuboradi.
 
-    Natijalarni NotificationLog orqali qayd etadi.
-    Muvaffaqiyatsiz yuborishlarda mavjud logni yangilaydi,
-    shu orqali UniqueConstraint buzilishining oldini oladi.
+    Yuborish tartibi:
+    1. Alohida Premium Custom Emoji.
+    2. Asosiy tug‘ilgan kun tabrigi.
+    3. Tabrik musiqasi.
+
+    Natijalar NotificationLog orqali qayd etiladi.
     """
 
     today = local_today()
@@ -37,6 +49,11 @@ async def send_daily_birthdays(bot) -> None:
     )
 
     async with SessionLocal() as session:
+
+        # ====================================================
+        # 1. BUGUN TUG‘ILGAN KUN BO‘LGAN INSONLARNI OLISH
+        # ====================================================
+
         people = await birthdays_today(session, today)
 
         if not people:
@@ -45,11 +62,16 @@ async def send_daily_birthdays(bot) -> None:
             )
             return
 
+        # ====================================================
+        # 2. FAOL GURUHLARNI ANIQLASH
+        # ====================================================
+
         result = await session.scalars(
             select(GroupConfig).where(
                 GroupConfig.is_active.is_(True)
             )
         )
+
         configs = list(result.all())
 
         target_ids = list(
@@ -74,8 +96,13 @@ async def send_daily_birthdays(bot) -> None:
             len(target_ids),
         )
 
+        # ====================================================
+        # 3. HAR BIR INSON UCHUN TABRIK YUBORISH
+        # ====================================================
+
         for person in people:
-            # Faqat to‘liq muvaffaqiyatli yuborilgan tabrikni o'tkazib yuboramiz.
+
+            # Avval muvaffaqiyatli yuborilgan tabrikni takrorlamaymiz.
             if await already_notified(
                 session,
                 person.id,
@@ -92,20 +119,62 @@ async def send_daily_birthdays(bot) -> None:
             text = make_greeting(person, today)
 
             sent_message_id = None
+
             successful_targets = 0
             failed_targets = []
+            failed_emoji_targets = []
+
+            # =================================================
+            # 4. HAR BIR GURUHGA XABAR YUBORISH
+            # =================================================
 
             for chat_id in target_ids:
+
+                # ---------------------------------------------
+                # 4.1. AVVAL PREMIUM EMOJI YUBORILADI
+                # ---------------------------------------------
+
                 try:
-                    # Avval asosiy tabrik yuboriladi.
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=PREMIUM_PARTY_EMOJI,
+                        parse_mode="HTML",
+                    )
+
+                    logger.info(
+                        "Premium bayram emojisi yuborildi: "
+                        "person_id=%s, chat_id=%s",
+                        person.id,
+                        chat_id,
+                    )
+
+                except Exception:
+                    failed_emoji_targets.append(chat_id)
+
+                    logger.exception(
+                        "Premium emoji yuborilmadi: "
+                        "person_id=%s, chat_id=%s",
+                        person.id,
+                        chat_id,
+                    )
+
+                # ---------------------------------------------
+                # 4.2. ASOSIY TABRIK YUBORILADI
+                # ---------------------------------------------
+
+                try:
+
                     if person.photo_file_id:
+
                         sent = await bot.send_photo(
                             chat_id=chat_id,
                             photo=person.photo_file_id,
                             caption=text,
                             parse_mode="HTML",
                         )
+
                     else:
+
                         sent = await bot.send_message(
                             chat_id=chat_id,
                             text=text,
@@ -123,6 +192,7 @@ async def send_daily_birthdays(bot) -> None:
                     )
 
                 except Exception:
+
                     failed_targets.append(chat_id)
 
                     logger.exception(
@@ -131,12 +201,17 @@ async def send_daily_birthdays(bot) -> None:
                         person.id,
                         chat_id,
                     )
+
                     continue
 
-                # Musiqa alohida yuboriladi.
-                # Musiqa xatosi asosiy tabrik muvaffaqiyatini bekor qilmaydi.
+                # ---------------------------------------------
+                # 4.3. TABRIK MUSIQASI YUBORILADI
+                # ---------------------------------------------
+
                 if person.music_file_id:
+
                     try:
+
                         await bot.send_audio(
                             chat_id=chat_id,
                             audio=person.music_file_id,
@@ -146,7 +221,15 @@ async def send_daily_birthdays(bot) -> None:
                             ),
                         )
 
+                        logger.info(
+                            "Tabrik musiqasi yuborildi: "
+                            "person_id=%s, chat_id=%s",
+                            person.id,
+                            chat_id,
+                        )
+
                     except Exception:
+
                         logger.exception(
                             "Tabrik musiqasi yuborilmadi: "
                             "person_id=%s, chat_id=%s",
@@ -154,9 +237,12 @@ async def send_daily_birthdays(bot) -> None:
                             chat_id,
                         )
 
-            # Joriy yil uchun mavjud logni topamiz.
-            # Yangi log faqat mavjud bo‘lmaganida yaratiladi.
+            # =================================================
+            # 5. NATIJANI NOTIFICATION LOG GA SAQLASH
+            # =================================================
+
             try:
+
                 log_entry = await session.scalar(
                     select(NotificationLog).where(
                         NotificationLog.person_id == person.id,
@@ -164,45 +250,65 @@ async def send_daily_birthdays(bot) -> None:
                     )
                 )
 
+                # Asosiy tabrik yuborilish holati.
                 if successful_targets == len(target_ids):
+
                     status = "sent"
+
                 elif successful_targets > 0:
+
                     status = "partial"
+
                 else:
+
                     status = "failed"
 
-                error_message = None
+                # Xatoliklarni qayd etish.
+                error_messages = []
 
                 if failed_targets:
-                    error_message = (
+                    error_messages.append(
                         "Asosiy tabrik yuborilmagan guruhlar: "
                         f"{failed_targets}"
-                    )[:2000]
+                    )
 
+                if failed_emoji_targets:
+                    error_messages.append(
+                        "Premium emoji yuborilmagan guruhlar: "
+                        f"{failed_emoji_targets}"
+                    )
+
+                error_message = (
+                    "\n".join(error_messages)[:2000]
+                    if error_messages
+                    else None
+                )
+
+                sent_at = (
+                    datetime.now(ZoneInfo(settings.timezone))
+                    if successful_targets > 0
+                    else None
+                )
+
+                # Mavjud logni yangilash yoki yangi yaratish.
                 if log_entry is None:
+
                     log_entry = NotificationLog(
                         person_id=person.id,
                         birthday_year=today.year,
                         status=status,
                         telegram_message_id=sent_message_id,
-                        sent_at=(
-                            datetime.now(ZoneInfo(settings.timezone))
-                            if successful_targets > 0
-                            else None
-                        ),
+                        sent_at=sent_at,
                         error_message=error_message,
                     )
+
                     session.add(log_entry)
 
                 else:
-                    # UniqueConstraint buzilmasligi uchun mavjud yozuv yangilanadi.
+
                     log_entry.status = status
                     log_entry.telegram_message_id = sent_message_id
-                    log_entry.sent_at = (
-                        datetime.now(ZoneInfo(settings.timezone))
-                        if successful_targets > 0
-                        else None
-                    )
+                    log_entry.sent_at = sent_at
                     log_entry.error_message = error_message
 
                 await session.commit()
@@ -210,14 +316,17 @@ async def send_daily_birthdays(bot) -> None:
                 logger.info(
                     "Yuborish natijasi bazaga saqlandi: "
                     "person_id=%s, status=%s, "
-                    "muvaffaqiyatli=%s, xatolik=%s",
+                    "muvaffaqiyatli=%s, asosiy_xatolik=%s, "
+                    "emoji_xatolik=%s",
                     person.id,
                     status,
                     successful_targets,
                     len(failed_targets),
+                    len(failed_emoji_targets),
                 )
 
             except Exception:
+
                 await session.rollback()
 
                 logger.exception(
@@ -225,30 +334,37 @@ async def send_daily_birthdays(bot) -> None:
                     person.id,
                 )
 
-    logger.info("Tug‘ilgan kunlarni tekshirish yakunlandi.")
+    logger.info(
+        "Tug‘ilgan kunlarni tekshirish yakunlandi."
+    )
 
+
+# ============================================================
+# APSCHEDULER SETUP
+# ============================================================
 
 def setup_scheduler(bot) -> AsyncIOScheduler:
     """
     Tug‘ilgan kun tabriklarini belgilangan vaqtda yuboradigan
     scheduler yaratadi.
-
-    Scheduler main.py faylida ishga tushirilishi kerak.
     """
 
     try:
+
         hour, minute = map(
             int,
             settings.birthday_reminder_time.split(":"),
         )
 
     except (ValueError, AttributeError):
+
         raise ValueError(
             "BIRTHDAY_REMINDER_TIME noto‘g‘ri. "
             "Vaqt HH:MM formatida bo‘lishi kerak, masalan: 09:00"
         ) from None
 
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+
         raise ValueError(
             "BIRTHDAY_REMINDER_TIME soat 00–23 va minut 00–59 "
             "oralig‘ida bo‘lishi kerak."
@@ -256,7 +372,9 @@ def setup_scheduler(bot) -> AsyncIOScheduler:
 
     timezone = ZoneInfo(settings.timezone)
 
-    scheduler = AsyncIOScheduler(timezone=timezone)
+    scheduler = AsyncIOScheduler(
+        timezone=timezone
+    )
 
     scheduler.add_job(
         send_daily_birthdays,
@@ -280,4 +398,3 @@ def setup_scheduler(bot) -> AsyncIOScheduler:
     )
 
     return scheduler
-
