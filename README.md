@@ -96,6 +96,17 @@ Xabarlarda Telegramning rasmiy **Animated Emoji** to‘plamidagi (`RestrictedEmo
 - Dizaynni o‘zingizga yuborib ko‘rish: `python -m app.test_emoji_send`
 - Guruhlarni tekshirish: `python -m app.check_groups`
 
+## 8. Tezlikni kuzatish
+Har bir komanda qancha vaqtda bajarilgani logga yoziladi, sekinlari `(SEKIN)` belgisi bilan:
+
+```powershell
+docker logs -f family_birthday_bot | Select-String app.timing
+```
+
+- 1.5 soniyadan uzoq davom etgan komandalar va 1 soniyadan sekin Telegram API so'rovlari `WARNING` bo'lib chiqadi.
+- Xabar matni (masalan, parol) logga yozilmaydi, faqat komanda nomi.
+- Bitta token bilan faqat **bitta** bot nusxasi ishlashi kerak, aks holda `TelegramConflictError` va kechikishlar bo'ladi.
+
 ## Muhim
 - Baza sxemasi ishga tushganda avtomatik yangilanadi (`init_db`), Docker'da esa avval `alembic upgrade head` bajariladi.
 - Scheduler faqat bot ishlayotgan vaqtda ishlaydi.

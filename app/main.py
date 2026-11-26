@@ -10,6 +10,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, LinkPreviewOptions
 from app.config import get_settings
 from app.database import close_db, init_db
 from app.handlers import router
+from app.middlewares import SlowRequestMiddleware, UpdateTimingMiddleware
 from app.scheduler import setup_scheduler
 
 
@@ -54,6 +55,8 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    # aiogram'ning "Update ... is handled" yozuvi o'rniga app.timing ishlatiladi.
+    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
     logger = logging.getLogger(__name__)
 
@@ -76,7 +79,11 @@ async def main() -> None:
             ),
         )
 
+        # Tezlikni kuzatish: har bir update vaqti va sekin API so'rovlari.
+        bot.session.middleware(SlowRequestMiddleware())
+
         dp = Dispatcher()
+        dp.update.outer_middleware(UpdateTimingMiddleware())
         dp.include_router(router)
 
         await setup_bot_commands(bot, settings.admin_ids)
