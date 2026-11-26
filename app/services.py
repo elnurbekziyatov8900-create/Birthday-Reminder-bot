@@ -168,10 +168,30 @@ def make_greeting_caption(person: Person | PersonData, today: date) -> str:
     )
 
 
-def make_greeting(person: Person | PersonData, today: date) -> str:
+def make_greeting(
+    person: Person | PersonData,
+    today: date,
+    compact: bool = False,
+) -> str:
+    """To'liq tabrik matni.
+
+    ``compact=True`` bo'lsa to'rtlik qismi tushirib qoldiriladi — juda uzun
+    ism bilan ham matn surat ostiga (1024 belgi) sig'ishi uchun.
+    """
+
     name = safe(person.full_name)
     age = age_on(person.birth_date, today)
     poem = "\n".join(safe(line) for line in POEM_LINES)
+
+    poem_section = (
+        ""
+        if compact
+        else (
+            f"{e('bouquet')} <b>Siz uchun samimiy to'rtlik</b>\n"
+            + quote(f"<i>{poem}</i>")
+            + "\n\n"
+        )
+    )
 
     return (
         f"{e('confetti')}{e('party')}{e('cake')}{e('party')}{e('confetti')}\n"
@@ -190,13 +210,9 @@ def make_greeting(person: Person | PersonData, today: date) -> str:
             "Har doim yaqinlaringiz ardog'ida, mehr va e'tibor "
             "qurshovida bo'ling!"
         )
-        + "\n"
-        "\n"
-        f"{e('bouquet')} <b>Siz uchun samimiy to'rtlik</b>\n"
-        + quote(f"<i>{poem}</i>")
-        + "\n"
-        "\n"
-        f"{DIVIDER}\n"
+        + "\n\n"
+        + poem_section
+        + f"{DIVIDER}\n"
         f"{e('heart_gift')} {hint('Oilamiz nomidan cheksiz mehr bilan')}\n"
         f"{e('trophy')} <b>Yangi yoshingiz yangi zafarlar olib kelsin!</b> "
         f"{e('glowing_star')}"

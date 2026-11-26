@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
+from html import unescape
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -17,6 +19,7 @@ from aiogram.exceptions import (
     TelegramMigrateToChat,
     TelegramRetryAfter,
 )
+from aiogram.types import ReplyParameters
 from sqlalchemy import delete, select, update
 
 from app.config import get_settings
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
 SAFE_TEXT_LIMIT = 4000
 MAX_RETRY_AFTER_SECONDS = 60
 
@@ -41,6 +45,20 @@ MAX_RETRY_AFTER_SECONDS = 60
 # ================================================================
 # MATNNI BO'LAKLARGA AJRATISH
 # ================================================================
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def telegram_length(html_text: str) -> int:
+    """HTML teglarsiz matn uzunligi (Telegram UTF-16 birliklarida sanaydi).
+
+    Telegram limiti (caption: 1024, xabar: 4096) teglar emas, balki
+    foydalanuvchi ko'radigan matnga qo'llanadi.
+    """
+
+    visible = unescape(_TAG_RE.sub("", html_text))
+    return len(visible.encode("utf-16-le")) // 2
+
 
 def split_html_text(text: str, limit: int = SAFE_TEXT_LIMIT) -> list[str]:
     """Uzun HTML matnni Telegram limitiga mos bo'laklarga ajratadi.
@@ -259,20 +277,33 @@ async def send_birthday_greeting(
 
     try:
         if person.photo_file_id:
-            # Surat ostiga qisqa sarlavha, to'liq tabrik esa alohida xabar:
-            # caption limiti 1024 belgi, tabrik matni esa undan uzun.
+            # Surat va to'liq tabrik BITTA xabarda: tabrik surat ostiga
+            # (caption) joylanadi. Limitdan oshsa, to'rtliksiz ixcham variant,
+            # u ham sig'masa — qisqa sarlavha + alohida matn.
+            caption = greeting
+
+            if telegram_length(caption) > TELEGRAM_CAPTION_LIMIT:
+                caption = make_greeting(person, today, compact=True)
+
+            fits = telegram_length(caption) <= TELEGRAM_CAPTION_LIMIT
+
+            if not fits:
+                caption = make_greeting_caption(person, today)
+
             sent, chat_id = await _call(
                 lambda cid: bot.send_photo(
                     chat_id=cid,
                     photo=person.photo_file_id,
-                    caption=make_greeting_caption(person, today),
+                    caption=caption,
                     parse_mode="HTML",
                 ),
                 chat_id,
             )
             result.message_id = sent.message_id
-            ids, chat_id = await send_text(bot, chat_id, greeting)
-            result.extra_message_ids.extend(ids)
+
+            if not fits:
+                ids, chat_id = await send_text(bot, chat_id, greeting)
+                result.extra_message_ids.extend(ids)
 
         else:
             ids, chat_id = await send_text(bot, chat_id, greeting)
@@ -305,6 +336,18 @@ async def send_birthday_greeting(
     result.chat_id = chat_id
 
     if person.music_file_id:
+        # Telegram bitta xabarda ham surat, ham audio bo'lishiga ruxsat
+        # bermaydi, shuning uchun qo'shiq tabrikka "javob" sifatida
+        # yuboriladi — chatda ular bir-biriga bog'langan holda ko'rinadi.
+        reply_to = (
+            ReplyParameters(
+                message_id=result.message_id,
+                allow_sending_without_reply=True,
+            )
+            if result.message_id
+            else None
+        )
+
         try:
             await _call(
                 lambda cid: bot.send_audio(
@@ -312,6 +355,7 @@ async def send_birthday_greeting(
                     audio=person.music_file_id,
                     caption=music_caption(person.full_name),
                     parse_mode="HTML",
+                    reply_parameters=reply_to,
                 ),
                 chat_id,
             )
