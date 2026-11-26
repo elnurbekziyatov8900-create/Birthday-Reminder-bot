@@ -359,12 +359,18 @@ def music_caption(full_name: str) -> str:
 # MA'LUMOTLAR BAZASI
 # ================================================================
 
-async def list_people(session: AsyncSession) -> list[Person]:
-    result = await session.scalars(
-        select(Person)
-        .where(Person.is_active.is_(True))
-        .order_by(Person.full_name.asc())
-    )
+async def list_people(
+    session: AsyncSession,
+    group_id: int | None = None,
+) -> list[Person]:
+    """Faol insonlar. ``group_id`` berilsa — faqat shu guruh jadvali."""
+
+    query = select(Person).where(Person.is_active.is_(True))
+
+    if group_id is not None:
+        query = query.where(Person.group_id == group_id)
+
+    result = await session.scalars(query.order_by(Person.full_name.asc()))
 
     return list(result.all())
 
@@ -372,8 +378,9 @@ async def list_people(session: AsyncSession) -> list[Person]:
 async def birthdays_today(
     session: AsyncSession,
     today: date,
+    group_id: int | None = None,
 ) -> list[Person]:
-    people = await list_people(session)
+    people = await list_people(session, group_id)
 
     return [
         person

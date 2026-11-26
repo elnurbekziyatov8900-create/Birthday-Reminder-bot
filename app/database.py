@@ -91,7 +91,45 @@ SCHEMA_UPGRADE_SQL: tuple[str, ...] = (
     END
     $$;
     """,
+    # --- Ko'p guruhli rejim: har bir inson bitta guruh jadvaliga tegishli ---
+    "ALTER TABLE people ADD COLUMN IF NOT EXISTS group_id INTEGER",
+    "CREATE INDEX IF NOT EXISTS ix_people_group_id ON people (group_id)",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'fk_people_group_id'
+        ) THEN
+            ALTER TABLE people
+            ADD CONSTRAINT fk_people_group_id
+            FOREIGN KEY (group_id) REFERENCES group_config (id)
+            ON DELETE SET NULL;
+        END IF;
+    END
+    $$;
+    """,
+    # Eski (guruhsiz) yozuvlar: bazada aynan bitta guruh bo'lsa, o'shanga
+    # biriktiriladi. Bir nechta guruh bo'lsa, admin ularni /assign bilan
+    # o'zi biriktiradi.
+    """
+    UPDATE people
+    SET group_id = (SELECT id FROM group_config ORDER BY id LIMIT 1)
+    WHERE group_id IS NULL
+      AND (SELECT count(*) FROM group_config) = 1
+    """,
+    "ALTER TABLE auth_users "
+    "ADD COLUMN IF NOT EXISTS selected_group_id INTEGER",
 )
+
+
+# Bazada birorta ham guruh bo'lmasa, .env dagi TARGET_GROUP_ID birinchi
+# guruh sifatida qo'shiladi. Keyin guruhlar faqat bazadan boshqariladi.
+SEED_TARGET_GROUP_SQL = """
+INSERT INTO group_config (chat_id, title, timezone, reminder_time, is_active)
+SELECT $1, 'Oila guruhi', $2, $3, true
+WHERE NOT EXISTS (SELECT 1 FROM group_config)
+"""
 
 
 async def init_db() -> None:
@@ -100,6 +138,16 @@ async def init_db() -> None:
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+
+            if settings.target_group_id:
+                await connection.exec_driver_sql(
+                    SEED_TARGET_GROUP_SQL,
+                    (
+                        settings.target_group_id,
+                        settings.timezone,
+                        settings.birthday_reminder_time,
+                    ),
+                )
 
             for statement in SCHEMA_UPGRADE_SQL:
                 await connection.exec_driver_sql(statement)

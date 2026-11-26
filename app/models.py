@@ -27,6 +27,18 @@ class Person(Base):
     music_file_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Inson qaysi guruhning (oilaning) jadvaliga tegishli. Tabrik faqat
+    # shu guruhga yuboriladi. group_config.id ga bog'langan (chat_id emas),
+    # shuning uchun guruh superguruhga ko'chsa ham bog'lanish saqlanadi.
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "group_config.id",
+            ondelete="SET NULL",
+            name="fk_people_group_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -65,6 +77,11 @@ class AuthUser(Base):
     )
     last_authenticated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+    # Shaxsiy chatda komandalar qaysi guruh jadvali bilan ishlashi.
+    selected_group_id: Mapped[int | None] = mapped_column(
+        Integer,
         nullable=True,
     )
 

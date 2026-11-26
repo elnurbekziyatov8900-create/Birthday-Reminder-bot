@@ -52,13 +52,21 @@ python -m app.main
 
 Bot bilan shaxsiy chatni oching, `/start` yuboring va `.env` dagi `BOT_ACCESS_PASSWORD` parolini kiriting. `ADMIN_USER_IDS` ichida aynan sizning Telegram user ID raqamingiz bo‘lishi shart.
 
-## 5. Guruhni ulash
-1. Botni oilaviy guruhga qo‘shing.
-2. Botga xabar yuborish ruxsatini bering.
-3. Guruh ichida `/setgroup` yuboring — bu guruh **asosiy guruh** bo‘ladi, eski guruhlar bazadan o‘chiriladi.
-4. `.env` dagi `TARGET_GROUP_ID` faqat bazada birorta ham guruh bo‘lmaganda zaxira sifatida ishlatiladi.
-5. Superguruh ID si doim `-100` bilan boshlanadi (masalan `-1001234567890`). To‘g‘ri ID ni guruh ichida `/chatid` orqali bilib oling.
-6. Oddiy guruh superguruhga aylansa, bot yangi ID ni avtomatik saqlaydi.
+## 5. Guruhlar va oila jadvallari
+Bot bir vaqtda **bir nechta guruhda** ishlay oladi. Har bir guruhning **o'z oila jadvali** bor:
+tabrik faqat o'sha guruh jadvalidagi inson uchun va faqat o'sha guruhga yuboriladi.
+
+1. Botni oilaviy guruhga qo'shing va xabar yuborish ruxsatini bering.
+2. Guruh ichida `/setgroup` yuboring — guruh ulanadi (boshqa guruhlar o'chirilmaydi).
+3. Bot bilan shaxsiy chatda `/groups` — guruhni tugma orqali tanlang.
+4. `/add`, `/birthdays`, `/edit` va boshqa komandalar **tanlangan guruh** jadvali bilan ishlaydi.
+5. Guruh ichida `/birthdays`, `/today`, `/next`, `/upcoming` aynan shu guruh jadvalini ko'rsatadi.
+6. Guruhni o'chirish: guruh ichida `/removegroup` (jadval saqlanib qoladi).
+7. Insonni boshqa guruhga o'tkazish: kerakli guruhni tanlab, `/assign ID`.
+
+- `.env` dagi `TARGET_GROUP_ID` faqat bazada birorta ham guruh bo'lmaganda birinchi guruh sifatida qo'shiladi.
+- Superguruh ID si doim `-100` bilan boshlanadi. To'g'ri ID ni guruh ichida `/chatid` orqali bilib oling.
+- Oddiy guruh superguruhga aylansa, bot yangi ID ni avtomatik saqlaydi (jadval yo'qolmaydi).
 
 ## 6. Asosiy komandalar
 - `/start` — autentifikatsiya
@@ -71,8 +79,10 @@ Bot bilan shaxsiy chatni oching, `/start` yuboring va `.env` dagi `BOT_ACCESS_PA
 - `/setphoto ID` — surat biriktirish
 - `/setmusic ID` — audio biriktirish
 - `/testbirthday ID` — test tabrigi
-- `/groups` — ulangan guruhlar
-- `/setgroup` — joriy guruhni asosiy guruh qilish
+- `/groups` — guruhlar va guruhni tanlash
+- `/setgroup` — guruhni ulash (guruh ichida)
+- `/removegroup` — guruhni o'chirish (guruh ichida)
+- `/assign ID` — insonni tanlangan guruhga o'tkazish
 - `/chatid` — chat ID
 - `/delete ID` — insonni arxivlash
 - `/status` — holat

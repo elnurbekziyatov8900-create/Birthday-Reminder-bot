@@ -106,7 +106,7 @@ async def _process_group(bot: Bot, group: GroupTarget) -> None:
         # "expire" qiladi va async rejimda lazy-load xatosi chiqardi.
         people = [
             PersonData.from_person(person)
-            for person in await birthdays_today(session, today)
+            for person in await birthdays_today(session, today, group.id)
         ]
 
     if not people:

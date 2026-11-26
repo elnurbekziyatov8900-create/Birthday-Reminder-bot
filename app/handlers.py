@@ -7,17 +7,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
-from sqlalchemy import delete, select
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.database import SessionLocal
 from app.messaging import (
-    get_active_groups,
     migrate_group_chat_id,
     send_birthday_greeting,
     split_html_text,
@@ -46,6 +50,7 @@ LOCKOUT_MINUTES = 15
 MAX_NAME_LENGTH = 200
 MAX_AUDIO_SIZE = 20 * 1024 * 1024
 UPCOMING_DAYS = 30
+GROUP_CALLBACK_PREFIX = "grp:"
 
 
 class AuthStates(StatesGroup):
@@ -82,7 +87,8 @@ WELCOME_TEXT = card(
 )
 
 MENU_SHORT = (
-    f"{e('calendar')} /birthdays — barcha tug'ilgan kunlar\n"
+    f"{e('family')} /groups — guruhni tanlash\n"
+    f"{e('calendar')} /birthdays — guruh jadvali\n"
     f"{e('party')} /today — bugungi tabriklar\n"
     f"{e('hourglass')} /next — eng yaqin sana\n"
     f"{e('bell')} /upcoming — keyingi {UPCOMING_DAYS} kun\n"
@@ -99,27 +105,32 @@ AUTH_SUCCESS_TEXT = card(
 
 HELP_TEXT = card(
     title("cake", "Family Birthday Assistant"),
-    hint("Boshqaruv qo'llanmasi"),
+    hint(
+        "Har bir guruhning o'z oila jadvali bor. Tabrik faqat o'sha "
+        "guruhga yuboriladi. Komandalar tanlangan guruh bilan ishlaydi."
+    ),
+    f"{e('family')} <b>GURUHLAR</b>\n"
+    + quote(
+        "/groups — guruhlar ro'yxati va guruhni tanlash\n"
+        "/setgroup — (guruh ichida) guruhni ulash\n"
+        "/removegroup — (guruh ichida) guruhni o'chirish\n"
+        "/chatid — joriy chat ID sini ko'rish"
+    ),
     f"{e('calendar')} <b>TUG'ILGAN KUNLAR</b>\n"
     + quote(
-        "/birthdays — barcha faol tug'ilgan kunlar\n"
+        "/birthdays — tanlangan guruh jadvali\n"
         "/today — bugungi tug'ilgan kunlar\n"
         "/next — navbatdagi tug'ilgan kun\n"
         f"/upcoming — keyingi {UPCOMING_DAYS} kun ichidagi sanalar"
     ),
-    f"{e('person')} <b>MA'LUMOTLARNI BOSHQARISH</b>\n"
+    f"{e('person')} <b>JADVALNI BOSHQARISH</b>\n"
     + quote(
-        "/add — yangi inson qo'shish\n"
+        "/add — guruh jadvaliga inson qo'shish\n"
         "/edit ID — ma'lumotlarni tahrirlash\n"
         "/delete ID — insonni arxivlash\n"
+        "/assign ID — insonni tanlangan guruhga o'tkazish\n"
         "/setphoto ID — surat biriktirish\n"
-        "/setmusic ID — musiqa biriktirish"
-    ),
-    f"{e('family')} <b>GURUH VA TABRIKLAR</b>\n"
-    + quote(
-        "/setgroup — joriy guruhni asosiy guruh qilish\n"
-        "/groups — ulangan guruhlar\n"
-        "/chatid — joriy chat ID sini ko'rish\n"
+        "/setmusic ID — musiqa biriktirish\n"
         "/testbirthday ID — test tabrigini yuborish"
     ),
     f"{e('robot')} <b>TIZIM</b>\n"
@@ -136,6 +147,10 @@ def _usage(emoji_key: str, command: str, example: str) -> str:
         f"{e(emoji_key)} Foydalanish: <code>{command}</code>\n"
         f"{hint('Masalan:')} <code>{example}</code>"
     )
+
+
+def _group_line(group: GroupConfig) -> str:
+    return f"{e('family')} Guruh: <b>{safe(group.title)}</b>"
 
 
 # ================================================================
@@ -220,10 +235,139 @@ async def require_admin(message: Message) -> bool:
     return True
 
 
-async def _get_active_person(session: Any, person_id: int) -> Person | None:
+async def _active_groups(session: Any) -> list[GroupConfig]:
+    result = await session.scalars(
+        select(GroupConfig)
+        .where(GroupConfig.is_active.is_(True))
+        .order_by(GroupConfig.title.asc(), GroupConfig.id.asc())
+    )
+
+    return list(result.all())
+
+
+async def _get_auth_user(session: Any, user_id: int) -> AuthUser | None:
+    return await session.scalar(
+        select(AuthUser).where(AuthUser.telegram_user_id == user_id)
+    )
+
+
+async def _selected_group(session: Any, user_id: int) -> GroupConfig | None:
+    """Admin tanlagan guruh. Faqat bitta guruh bo'lsa — avtomatik o'sha."""
+
+    user = await _get_auth_user(session, user_id)
+
+    if user and user.selected_group_id:
+        group = await session.get(GroupConfig, user.selected_group_id)
+
+        if group is not None and group.is_active:
+            return group
+
+    groups = await _active_groups(session)
+
+    if len(groups) == 1:
+        if user is not None:
+            user.selected_group_id = groups[0].id
+            await session.commit()
+
+        return groups[0]
+
+    return None
+
+
+def _groups_keyboard(
+    groups: list[GroupConfig],
+    selected_id: int | None,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if group.id == selected_id else "👨‍👩‍👧‍👦 ")
+                    + group.title[:60],
+                    callback_data=f"{GROUP_CALLBACK_PREFIX}{group.id}",
+                )
+            ]
+            for group in groups
+        ]
+    )
+
+
+async def _ask_to_choose_group(message: Message, session: Any) -> None:
+    groups = await _active_groups(session)
+
+    if not groups:
+        await message.answer(
+            card(
+                title("family", "Guruh ulanmagan"),
+                "1. Botni oilaviy guruhga qo'shing.\n"
+                "2. Guruh ichida /setgroup yuboring.",
+            )
+        )
+        return
+
+    await message.answer(
+        card(
+            title("family", "Avval guruhni tanlang"),
+            "Qaysi oila jadvali bilan ishlaymiz?",
+        ),
+        reply_markup=_groups_keyboard(groups, None),
+    )
+
+
+async def _admin_group(message: Message) -> GroupConfig | None:
+    """Shaxsiy chatdagi boshqaruv komandalari uchun: admin + tanlangan guruh."""
+
+    if not await require_admin(message):
+        return None
+
+    async with SessionLocal() as session:
+        group = await _selected_group(session, message.from_user.id)
+
+        if group is None:
+            await _ask_to_choose_group(message, session)
+
+        return group
+
+
+async def _view_group(message: Message) -> GroupConfig | None:
+    """Ko'rish komandalari: shaxsiy chatda — tanlangan guruh, guruh ichida
+    esa aynan shu guruhning jadvali (faqat avtorizatsiyadan o'tgan admin)."""
+
+    if message.chat.type == "private":
+        return await _admin_group(message)
+
+    if not message.from_user or not await authorized(message.from_user.id):
+        return None
+
+    async with SessionLocal() as session:
+        group = await session.scalar(
+            select(GroupConfig).where(
+                GroupConfig.chat_id == message.chat.id,
+                GroupConfig.is_active.is_(True),
+            )
+        )
+
+    if group is None:
+        await message.answer(
+            f"{e('warning')} Bu guruh hali ulanmagan. Ulash uchun /setgroup yuboring."
+        )
+
+    return group
+
+
+async def _get_person(
+    session: Any,
+    person_id: int,
+    group_id: int | None,
+) -> Person | None:
+    """Faol inson. ``group_id`` berilsa, inson shu guruhga tegishli bo'lishi shart."""
+
     person = await session.get(Person, person_id)
 
     if person is None or not person.is_active:
+        return None
+
+    if group_id is not None and person.group_id != group_id:
         return None
 
     return person
@@ -234,11 +378,15 @@ async def _send_long_text(message: Message, text: str) -> None:
         await message.answer(chunk)
 
 
-def _not_found_text() -> str:
+def _not_found_text(group: GroupConfig | None = None) -> str:
+    where = (
+        f" <b>{safe(group.title)}</b> guruhi jadvalida" if group is not None else ""
+    )
+
     return (
         f"{e('cross')} <b>Inson topilmadi.</b>\n"
-        "ID noto'g'ri yoki ushbu inson arxivlangan.\n"
-        + hint("Ro'yxat: /birthdays")
+        f"Bunday ID{where} yo'q yoki inson arxivlangan.\n"
+        + hint("Ro'yxat: /birthdays · Guruhni almashtirish: /groups")
     )
 
 
@@ -315,16 +463,12 @@ async def password_input(message: Message, state: FSMContext) -> None:
     if raw_password.startswith("/"):
         await message.answer(
             f"{e('lock')} <b>Parol kutilmoqda.</b>\n"
-            f"Parolni yuboring yoki /cancel orqali bekor qiling."
+            "Parolni yuboring yoki /cancel orqali bekor qiling."
         )
         return
 
     async with SessionLocal() as session:
-        user = await session.scalar(
-            select(AuthUser).where(
-                AuthUser.telegram_user_id == message.from_user.id
-            )
-        )
+        user = await _get_auth_user(session, message.from_user.id)
 
         if user is None:
             user = AuthUser(
@@ -394,10 +538,6 @@ async def password_input(message: Message, state: FSMContext) -> None:
     )
 
 
-# ================================================================
-# KO'RISH KOMANDALARI
-# ================================================================
-
 @router.message(Command("help"))
 async def help_command(message: Message) -> None:
     if not await require_admin(message):
@@ -406,33 +546,303 @@ async def help_command(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
-@router.message(Command("birthdays"))
-async def birthdays_command(message: Message) -> None:
+# ================================================================
+# GURUHLAR
+# ================================================================
+
+@router.message(Command("groups"))
+async def groups_command(message: Message) -> None:
     if not await require_admin(message):
         return
 
     async with SessionLocal() as session:
-        people = await list_people(session)
+        groups = await _active_groups(session)
+        selected = await _selected_group(session, message.from_user.id)
 
-    if not people:
+        counts = dict(
+            (
+                await session.execute(
+                    select(Person.group_id, func.count(Person.id))
+                    .where(Person.is_active.is_(True))
+                    .group_by(Person.group_id)
+                )
+            ).all()
+        )
+
+    if not groups:
         await message.answer(
-            f"{e('mailbox')} <b>Hozircha faol tug'ilgan kunlar yo'q.</b>\n"
-            f"{e('plus')} Yangi inson qo'shish: /add"
+            card(
+                title("family", "Ulangan guruhlar"),
+                f"{e('warning')} Hech qanday guruh ulanmagan.\n"
+                "Botni guruhga qo'shib, guruh ichida /setgroup yuboring.",
+            )
         )
         return
 
-    await _send_long_text(message, birthday_table(people, local_today()))
+    entries = "\n\n".join(
+        f"{e('check') if selected and group.id == selected.id else e('family')} "
+        f"<b>{safe(group.title)}</b>\n"
+        f"{e('people')} {counts.get(group.id, 0)} nafar · "
+        f"{e('alarm')} {group.reminder_time} · <code>{group.chat_id}</code>"
+        for group in groups
+    )
+
+    unassigned = counts.get(None, 0)
+    footer = ""
+
+    if unassigned:
+        footer = (
+            f"{e('warning')} Guruhga biriktirilmagan insonlar: <b>{unassigned}</b>\n"
+            + hint("Guruhni tanlab, /assign ID bilan biriktiring.")
+        )
+
+    current = (
+        f"{e('target')} Tanlangan: <b>{safe(selected.title)}</b>"
+        if selected
+        else f"{e('target')} Guruh tanlanmagan — quyidan tanlang."
+    )
+
+    await message.answer(
+        card(title("family", "Ulangan guruhlar"), entries, current, footer),
+        reply_markup=_groups_keyboard(groups, selected.id if selected else None),
+    )
+
+
+@router.callback_query(F.data.startswith(GROUP_CALLBACK_PREFIX))
+async def choose_group(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+
+    if user_id not in settings.admin_ids or not await authorized(user_id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+
+    try:
+        group_id = int((callback.data or "").removeprefix(GROUP_CALLBACK_PREFIX))
+    except ValueError:
+        await callback.answer()
+        return
+
+    async with SessionLocal() as session:
+        group = await session.get(GroupConfig, group_id)
+
+        if group is None or not group.is_active:
+            await callback.answer("Guruh topilmadi.", show_alert=True)
+            return
+
+        user = await _get_auth_user(session, user_id)
+
+        if user is not None:
+            user.selected_group_id = group.id
+            await session.commit()
+
+        group_title = group.title
+        groups = await _active_groups(session)
+
+    await callback.answer(f"Tanlandi: {group_title}"[:200])
+
+    if callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=_groups_keyboard(groups, group_id)
+            )
+        except TelegramBadRequest:
+            pass
+
+        await callback.message.answer(
+            f"{e('check')} Endi komandalar <b>{safe(group_title)}</b> "
+            "guruhi jadvali bilan ishlaydi.\n"
+            + hint("Jadval: /birthdays · Qo'shish: /add")
+        )
+
+
+@router.message(Command("chatid"))
+async def get_chat_id(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    if message.from_user.id not in settings.admin_ids:
+        await message.answer(
+            f"{e('cross')} Ushbu komanda faqat administrator uchun."
+        )
+        return
+
+    await message.answer(
+        card(
+            title("search", "Telegram chat ma'lumotlari"),
+            row("people", "Nomi", f"<b>{safe(message.chat.title or 'Shaxsiy chat')}</b>")
+            + "\n"
+            + row("key", "Chat ID", f"<code>{message.chat.id}</code>")
+            + "\n"
+            + row("folder", "Turi", f"<code>{message.chat.type}</code>"),
+        )
+    )
+
+
+async def _group_admin_check(message: Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if message.from_user.id not in settings.admin_ids:
+        await message.answer(f"{e('cross')} Ushbu amal faqat administrator uchun.")
+        return False
+
+    if message.chat.type not in {"group", "supergroup"}:
+        if await require_admin(message):
+            await message.answer(
+                card(
+                    title("family", "Guruhni ulash"),
+                    "1. Botni oilaviy guruhga qo'shing.\n"
+                    "2. Botga xabar yuborish ruxsatini bering.\n"
+                    "3. O'sha guruh ichida /setgroup yuboring.",
+                )
+            )
+        return False
+
+    if not await authorized(message.from_user.id):
+        await message.answer(
+            f"{e('lock')} Avval bot bilan shaxsiy chatda /start orqali "
+            "avtorizatsiyadan o'ting."
+        )
+        return False
+
+    return True
+
+
+@router.message(Command("setgroup"))
+async def set_group(message: Message) -> None:
+    if not await _group_admin_check(message):
+        return
+
+    chat_id = message.chat.id
+    chat_title = (message.chat.title or "Oila guruhi")[:255]
+
+    async with SessionLocal() as session:
+        cfg = await session.scalar(
+            select(GroupConfig).where(GroupConfig.chat_id == chat_id)
+        )
+        is_new = cfg is None
+
+        if cfg is None:
+            cfg = GroupConfig(chat_id=chat_id)
+            session.add(cfg)
+
+        cfg.title = chat_title
+        cfg.timezone = settings.timezone
+        cfg.reminder_time = settings.birthday_reminder_time
+        cfg.is_active = True
+        await session.flush()
+
+        # Shaxsiy chatdagi komandalar endi shu guruh bilan ishlaydi.
+        user = await _get_auth_user(session, message.from_user.id)
+
+        if user is not None:
+            user.selected_group_id = cfg.id
+
+        people_count = await session.scalar(
+            select(func.count(Person.id)).where(
+                Person.group_id == cfg.id,
+                Person.is_active.is_(True),
+            )
+        )
+
+        await session.commit()
+
+    logger.info("Guruh ulandi: chat_id=%s, yangi=%s", chat_id, is_new)
+
+    await message.answer(
+        card(
+            title("check", "Guruh ulandi" if is_new else "Guruh yangilandi"),
+            row("family", "Guruh", f"<b>{safe(chat_title)}</b>")
+            + "\n"
+            + row("people", "Jadvalda", f"<b>{people_count or 0}</b> nafar")
+            + "\n"
+            + row("alarm", "Eslatma vaqti", f"<code>{settings.birthday_reminder_time}</code>")
+            + "\n"
+            + row("globe", "Vaqt zonasi", f"<code>{safe(settings.timezone)}</code>"),
+            hint(
+                "Bu guruh jadvaliga insonlarni bot bilan shaxsiy chatda "
+                "/add orqali qo'shing — tabriklar faqat shu guruhga boradi."
+            ),
+        )
+    )
+
+
+@router.message(Command("removegroup"))
+async def remove_group(message: Message) -> None:
+    if not await _group_admin_check(message):
+        return
+
+    async with SessionLocal() as session:
+        cfg = await session.scalar(
+            select(GroupConfig).where(GroupConfig.chat_id == message.chat.id)
+        )
+
+        if cfg is None or not cfg.is_active:
+            await message.answer(f"{e('bulb')} Bu guruh ulanmagan.")
+            return
+
+        # Yozuv o'chirilmaydi, faqat faolsizlantiriladi: jadval saqlanib
+        # qoladi va /setgroup bilan qayta yoqish mumkin.
+        cfg.is_active = False
+        await session.commit()
+
+    await message.answer(
+        card(
+            title("folder", "Guruh o'chirildi"),
+            "Bu guruhga endi tabrik yuborilmaydi.\n"
+            + hint("Jadval saqlanib qoldi. Qayta yoqish: /setgroup"),
+        )
+    )
+
+
+@router.message(F.migrate_to_chat_id)
+async def group_migrated(message: Message) -> None:
+    """Oddiy guruh superguruhga aylanganda chat ID avtomatik yangilanadi."""
+
+    await migrate_group_chat_id(message.chat.id, message.migrate_to_chat_id)
+
+
+# ================================================================
+# KO'RISH KOMANDALARI
+# ================================================================
+
+@router.message(Command("birthdays"))
+async def birthdays_command(message: Message) -> None:
+    group = await _view_group(message)
+
+    if group is None:
+        return
+
+    async with SessionLocal() as session:
+        people = await list_people(session, group.id)
+
+    if not people:
+        await message.answer(
+            card(
+                title("mailbox", "Jadval hozircha bo'sh"),
+                _group_line(group),
+                f"{e('plus')} Yangi inson qo'shish: /add",
+            )
+        )
+        return
+
+    await _send_long_text(
+        message,
+        birthday_table(people, local_today(), heading=f"{group.title} — tug'ilgan kunlar"),
+    )
 
 
 @router.message(Command("today"))
 async def today_command(message: Message) -> None:
-    if not await require_admin(message):
+    group = await _view_group(message)
+
+    if group is None:
         return
 
     today = local_today()
 
     async with SessionLocal() as session:
-        people = await list_people(session)
+        people = await list_people(session, group.id)
 
     found = [
         person
@@ -444,7 +854,8 @@ async def today_command(message: Message) -> None:
         await message.answer(
             card(
                 title("party", "Bugungi tug'ilgan kunlar"),
-                f"{e('calendar')} {format_date_uz(today)}\n"
+                _group_line(group)
+                + f"\n{e('calendar')} {format_date_uz(today)}",
                 f"Bugun tug'ilgan kuni bo'lgan inson yo'q. {e('yellow_heart')}",
             )
         )
@@ -460,26 +871,27 @@ async def today_command(message: Message) -> None:
         message,
         card(
             title("party", "Bugungi tug'ilgan kunlar"),
-            f"{e('calendar')} {format_date_uz(today)}",
+            _group_line(group) + f"\n{e('calendar')} {format_date_uz(today)}",
             entries,
-            hint("Test tabrik: /testbirthday ID"),
         ),
     )
 
 
 @router.message(Command("next"))
 async def next_command(message: Message) -> None:
-    if not await require_admin(message):
+    group = await _view_group(message)
+
+    if group is None:
         return
 
     today = local_today()
 
     async with SessionLocal() as session:
-        people = await list_people(session)
+        people = await list_people(session, group.id)
 
     if not people:
         await message.answer(
-            f"{e('mailbox')} Bazada faol insonlar yo'q. Qo'shish: /add"
+            f"{e('mailbox')} <b>{safe(group.title)}</b> jadvali bo'sh. Qo'shish: /add"
         )
         return
 
@@ -496,6 +908,7 @@ async def next_command(message: Message) -> None:
     await message.answer(
         card(
             title("cake", "Eng yaqin tug'ilgan kun"),
+            _group_line(group),
             row("person", "Ism", f"<b>{safe(person.full_name)}</b>")
             + "\n"
             + row("calendar", "Sana", format_date_uz(person.birth_date))
@@ -512,13 +925,15 @@ async def next_command(message: Message) -> None:
 
 @router.message(Command("upcoming"))
 async def upcoming_command(message: Message) -> None:
-    if not await require_admin(message):
+    group = await _view_group(message)
+
+    if group is None:
         return
 
     today = local_today()
 
     async with SessionLocal() as session:
-        people = await list_people(session)
+        people = await list_people(session, group.id)
 
     found = [
         person
@@ -530,6 +945,7 @@ async def upcoming_command(message: Message) -> None:
         await message.answer(
             card(
                 title("bell", f"Keyingi {UPCOMING_DAYS} kun"),
+                _group_line(group),
                 "Ushbu davr ichida tug'ilgan kun yo'q.",
             )
         )
@@ -537,7 +953,11 @@ async def upcoming_command(message: Message) -> None:
 
     await _send_long_text(
         message,
-        birthday_table(found, today, heading=f"KEYINGI {UPCOMING_DAYS} KUN"),
+        birthday_table(
+            found,
+            today,
+            heading=f"{group.title} — keyingi {UPCOMING_DAYS} kun",
+        ),
     )
 
 
@@ -547,18 +967,22 @@ async def upcoming_command(message: Message) -> None:
 
 @router.message(Command("add"))
 async def add_start(message: Message, state: FSMContext) -> None:
-    if not await require_admin(message):
+    group = await _admin_group(message)
+
+    if group is None:
         return
 
     await state.clear()
+    await state.update_data(group_id=group.id, group_title=group.title)
     await state.set_state(AddStates.name)
 
     await message.answer(
         card(
             title("plus", "Yangi inson qo'shish"),
+            _group_line(group),
             f"{e('pencil')} <b>1/2</b> · To'liq ismni kiriting.\n"
             f"{hint('Masalan: Ali Valiyev')}",
-            CANCEL_HINT,
+            hint("Boshqa guruhga qo'shish uchun: /groups") + "\n" + CANCEL_HINT,
         )
     )
 
@@ -611,8 +1035,9 @@ async def add_birth_date(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     full_name = data.get("full_name")
+    group_id = data.get("group_id")
 
-    if not full_name:
+    if not full_name or not group_id:
         await state.clear()
         await message.answer(
             f"{e('warning')} Jarayon holati yo'qolgan. Qayta /add yuboring."
@@ -620,11 +1045,21 @@ async def add_birth_date(message: Message, state: FSMContext) -> None:
         return
 
     async with SessionLocal() as session:
-        person = Person(full_name=full_name, birth_date=birth_date)
+        group = await session.get(GroupConfig, int(group_id))
+
+        if group is None or not group.is_active:
+            await state.clear()
+            await message.answer(
+                f"{e('warning')} Guruh topilmadi yoki o'chirilgan. /groups"
+            )
+            return
+
+        person = Person(full_name=full_name, birth_date=birth_date, group_id=group.id)
         session.add(person)
         await session.commit()
         await session.refresh(person)
         person_id = person.id
+        group_title = group.title
 
     await state.clear()
 
@@ -635,6 +1070,8 @@ async def add_birth_date(message: Message, state: FSMContext) -> None:
             + "\n"
             + row("calendar", "Tug'ilgan sana", format_date_uz(birth_date))
             + "\n"
+            + row("family", "Guruh", f"<b>{safe(group_title)}</b>")
+            + "\n"
             + row("key", "ID", f"<code>{person_id}</code>"),
             f"{e('picture')} Surat: <code>/setphoto {person_id}</code>\n"
             f"{e('music')} Musiqa: <code>/setmusic {person_id}</code>\n"
@@ -644,12 +1081,14 @@ async def add_birth_date(message: Message, state: FSMContext) -> None:
 
 
 # ================================================================
-# TAHRIRLASH VA ARXIVLASH
+# TAHRIRLASH, ARXIVLASH, KO'CHIRISH
 # ================================================================
 
 @router.message(Command("edit"))
 async def edit_start(message: Message, state: FSMContext) -> None:
-    if not await require_admin(message):
+    group = await _admin_group(message)
+
+    if group is None:
         return
 
     person_id = _parse_person_id(message)
@@ -659,10 +1098,10 @@ async def edit_start(message: Message, state: FSMContext) -> None:
         return
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, person_id)
+        person = await _get_person(session, person_id, group.id)
 
         if person is None:
-            await message.answer(_not_found_text())
+            await message.answer(_not_found_text(group))
             return
 
         current_name = person.full_name
@@ -740,7 +1179,7 @@ async def edit_birth_date(message: Message, state: FSMContext) -> None:
     new_name = data.get("new_full_name")
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, int(person_id or 0))
+        person = await _get_person(session, int(person_id or 0), None)
 
         if person is None:
             await state.clear()
@@ -772,7 +1211,9 @@ async def edit_birth_date(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("delete"))
 async def delete_person(message: Message) -> None:
-    if not await require_admin(message):
+    group = await _admin_group(message)
+
+    if group is None:
         return
 
     person_id = _parse_person_id(message)
@@ -782,10 +1223,10 @@ async def delete_person(message: Message) -> None:
         return
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, person_id)
+        person = await _get_person(session, person_id, group.id)
 
         if person is None:
-            await message.answer(_not_found_text())
+            await message.answer(_not_found_text(group))
             return
 
         person.is_active = False
@@ -795,8 +1236,41 @@ async def delete_person(message: Message) -> None:
     await message.answer(
         card(
             title("folder", "Inson arxivlandi"),
-            row("person", "Ism", f"<b>{safe(name)}</b>"),
-            hint("U faol ro'yxat va kelgusi eslatmalarda qatnashmaydi."),
+            row("person", "Ism", f"<b>{safe(name)}</b>") + "\n" + _group_line(group),
+            hint("U jadval va kelgusi eslatmalarda qatnashmaydi."),
+        )
+    )
+
+
+@router.message(Command("assign"))
+async def assign_person(message: Message) -> None:
+    group = await _admin_group(message)
+
+    if group is None:
+        return
+
+    person_id = _parse_person_id(message)
+
+    if person_id is None:
+        await message.answer(_usage("family", "/assign ID", "/assign 5"))
+        return
+
+    async with SessionLocal() as session:
+        person = await _get_person(session, person_id, None)
+
+        if person is None:
+            await message.answer(_not_found_text())
+            return
+
+        person.group_id = group.id
+        await session.commit()
+        name = person.full_name
+
+    await message.answer(
+        card(
+            title("check", "Inson guruhga biriktirildi"),
+            row("person", "Ism", f"<b>{safe(name)}</b>") + "\n" + _group_line(group),
+            hint("Tabriklar endi faqat shu guruhga yuboriladi."),
         )
     )
 
@@ -805,41 +1279,50 @@ async def delete_person(message: Message) -> None:
 # MEDIA
 # ================================================================
 
-@router.message(Command("setphoto"))
-async def set_photo_start(message: Message, state: FSMContext) -> None:
-    if not await require_admin(message):
+async def _start_media(
+    message: Message,
+    state: FSMContext,
+    target_state: State,
+    emoji_key: str,
+    command: str,
+    prompt: str,
+) -> None:
+    group = await _admin_group(message)
+
+    if group is None:
         return
 
     person_id = _parse_person_id(message)
 
     if person_id is None:
-        await message.answer(_usage("picture", "/setphoto ID", "/setphoto 5"))
+        await message.answer(_usage(emoji_key, f"/{command} ID", f"/{command} 5"))
         return
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, person_id)
+        person = await _get_person(session, person_id, group.id)
 
         if person is None:
-            await message.answer(_not_found_text())
+            await message.answer(_not_found_text(group))
             return
 
         name = person.full_name
 
     await state.clear()
     await state.update_data(media_person_id=person_id)
-    await state.set_state(MediaStates.waiting_photo)
+    await state.set_state(target_state)
 
     await message.answer(
-        f"{e('picture')} <b>{safe(name)}</b> uchun surat yuboring.\n\n"
-        f"{CANCEL_HINT}"
+        f"{e(emoji_key)} <b>{safe(name)}</b> uchun {prompt}\n\n{CANCEL_HINT}"
     )
 
 
-@router.message(MediaStates.waiting_photo, F.photo)
-async def receive_photo(message: Message, state: FSMContext) -> None:
-    if not await require_admin(message):
-        return
-
+async def _save_media(
+    message: Message,
+    state: FSMContext,
+    field_name: str,
+    file_id: str,
+    saved_text: str,
+) -> None:
     data = await state.get_data()
     person_id = data.get("media_person_id")
 
@@ -851,22 +1334,44 @@ async def receive_photo(message: Message, state: FSMContext) -> None:
         return
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, int(person_id))
+        person = await _get_person(session, int(person_id), None)
 
         if person is None:
             await state.clear()
             await message.answer(_not_found_text())
             return
 
-        person.photo_file_id = message.photo[-1].file_id
+        setattr(person, field_name, file_id)
         await session.commit()
         name = person.full_name
 
     await state.clear()
 
     await message.answer(
-        f"{e('check')} <b>Surat saqlandi.</b>\n"
+        f"{e('check')} <b>{saved_text}</b>\n"
         f"{e('person')} Inson: <b>{safe(name)}</b>"
+    )
+
+
+@router.message(Command("setphoto"))
+async def set_photo_start(message: Message, state: FSMContext) -> None:
+    await _start_media(
+        message,
+        state,
+        MediaStates.waiting_photo,
+        "picture",
+        "setphoto",
+        "surat yuboring (oddiy rasm sifatida).",
+    )
+
+
+@router.message(MediaStates.waiting_photo, F.photo)
+async def receive_photo(message: Message, state: FSMContext) -> None:
+    if not await require_admin(message):
+        return
+
+    await _save_media(
+        message, state, "photo_file_id", message.photo[-1].file_id, "Surat saqlandi."
     )
 
 
@@ -883,32 +1388,14 @@ async def invalid_photo_input(message: Message) -> None:
 
 @router.message(Command("setmusic"))
 async def set_music_start(message: Message, state: FSMContext) -> None:
-    if not await require_admin(message):
-        return
-
-    person_id = _parse_person_id(message)
-
-    if person_id is None:
-        await message.answer(_usage("music", "/setmusic ID", "/setmusic 5"))
-        return
-
-    async with SessionLocal() as session:
-        person = await _get_active_person(session, person_id)
-
-        if person is None:
-            await message.answer(_not_found_text())
-            return
-
-        name = person.full_name
-
-    await state.clear()
-    await state.update_data(media_person_id=person_id)
-    await state.set_state(MediaStates.waiting_audio)
-
-    await message.answer(
-        f"{e('music')} <b>{safe(name)}</b> uchun audio yuboring.\n"
-        f"{hint('Audio yoki audio formatdagi hujjat (20 MB gacha).')}\n\n"
-        f"{CANCEL_HINT}"
+    await _start_media(
+        message,
+        state,
+        MediaStates.waiting_audio,
+        "music",
+        "setmusic",
+        "audio yuboring.\n"
+        + hint("Audio yoki audio formatdagi hujjat (20 MB gacha)."),
     )
 
 
@@ -948,34 +1435,7 @@ async def receive_audio(message: Message, state: FSMContext) -> None:
         )
         return
 
-    data = await state.get_data()
-    person_id = data.get("media_person_id")
-
-    if not person_id:
-        await state.clear()
-        await message.answer(
-            f"{e('warning')} Yuklash sessiyasi topilmadi. Qayta urinib ko'ring."
-        )
-        return
-
-    async with SessionLocal() as session:
-        person = await _get_active_person(session, int(person_id))
-
-        if person is None:
-            await state.clear()
-            await message.answer(_not_found_text())
-            return
-
-        person.music_file_id = file_id
-        await session.commit()
-        name = person.full_name
-
-    await state.clear()
-
-    await message.answer(
-        f"{e('check')} <b>Musiqa saqlandi.</b>\n"
-        f"{e('person')} Inson: <b>{safe(name)}</b>"
-    )
+    await _save_media(message, state, "music_file_id", file_id, "Musiqa saqlandi.")
 
 
 @router.message(MediaStates.waiting_audio)
@@ -990,173 +1450,14 @@ async def invalid_audio_input(message: Message) -> None:
 
 
 # ================================================================
-# GURUHLAR
-# ================================================================
-
-@router.message(Command("chatid"))
-async def get_chat_id(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    if message.from_user.id not in settings.admin_ids:
-        await message.answer(
-            f"{e('cross')} Ushbu komanda faqat administrator uchun."
-        )
-        return
-
-    await message.answer(
-        card(
-            title("search", "Telegram chat ma'lumotlari"),
-            row("people", "Nomi", f"<b>{safe(message.chat.title or 'Shaxsiy chat')}</b>")
-            + "\n"
-            + row("key", "Chat ID", f"<code>{message.chat.id}</code>")
-            + "\n"
-            + row("folder", "Turi", f"<code>{message.chat.type}</code>"),
-        )
-    )
-
-
-@router.message(Command("setgroup"))
-async def set_group(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    if message.from_user.id not in settings.admin_ids:
-        await message.answer(f"{e('cross')} Ushbu amal faqat administrator uchun.")
-        return
-
-    if message.chat.type == "private":
-        if not await require_admin(message):
-            return
-
-        await message.answer(
-            card(
-                title("family", "Guruhni ulash"),
-                "1. Botni oilaviy guruhga qo'shing.\n"
-                "2. Botga xabar yuborish ruxsatini bering.\n"
-                "3. O'sha guruh ichida /setgroup yuboring.",
-            )
-        )
-        return
-
-    if message.chat.type not in {"group", "supergroup"}:
-        await message.answer(
-            f"{e('warning')} Bu komanda faqat Telegram guruhida ishlaydi."
-        )
-        return
-
-    if not await authorized(message.from_user.id):
-        await message.answer(
-            f"{e('lock')} Avval bot bilan shaxsiy chatda /start orqali "
-            "avtorizatsiyadan o'ting."
-        )
-        return
-
-    chat_id = message.chat.id
-    chat_title = (message.chat.title or "Family group")[:255]
-
-    async with SessionLocal() as session:
-        # Bitta asosiy guruh: eski guruh ID'lari bazadan o'chiriladi,
-        # aks holda tabriklar eski guruhlarga ham yuborilaverardi.
-        removed = await session.scalars(
-            select(GroupConfig.chat_id).where(GroupConfig.chat_id != chat_id)
-        )
-        removed_ids = list(removed.all())
-
-        await session.execute(
-            delete(GroupConfig).where(GroupConfig.chat_id != chat_id)
-        )
-
-        cfg = await session.scalar(
-            select(GroupConfig).where(GroupConfig.chat_id == chat_id)
-        )
-
-        if cfg is None:
-            cfg = GroupConfig(chat_id=chat_id)
-            session.add(cfg)
-
-        cfg.title = chat_title
-        cfg.timezone = settings.timezone
-        cfg.reminder_time = settings.birthday_reminder_time
-        cfg.is_active = True
-
-        await session.commit()
-
-    logger.info("Asosiy guruh: %s, o'chirilganlar: %s", chat_id, removed_ids)
-
-    removed_text = ""
-
-    if removed_ids:
-        removed_text = f"{e('folder')} Eski guruhlar o'chirildi: " + ", ".join(
-            f"<code>{item}</code>" for item in removed_ids
-        )
-
-    env_hint = ""
-
-    if settings.target_group_id and settings.target_group_id != chat_id:
-        env_hint = hint(
-            f"Eslatma: .env dagi TARGET_GROUP_ID ({settings.target_group_id}) "
-            f"ni {chat_id} ga almashtirishni unutmang."
-        )
-
-    await message.answer(
-        card(
-            title("check", "Guruh asosiy guruh sifatida saqlandi"),
-            row("family", "Guruh", f"<b>{safe(chat_title)}</b>")
-            + "\n"
-            + row("key", "Chat ID", f"<code>{chat_id}</code>")
-            + "\n"
-            + row("alarm", "Eslatma vaqti", f"<code>{settings.birthday_reminder_time}</code>")
-            + "\n"
-            + row("globe", "Vaqt zonasi", f"<code>{safe(settings.timezone)}</code>"),
-            removed_text,
-            env_hint,
-        )
-    )
-
-
-@router.message(F.migrate_to_chat_id)
-async def group_migrated(message: Message) -> None:
-    """Oddiy guruh superguruhga aylanganda chat ID avtomatik yangilanadi."""
-
-    await migrate_group_chat_id(message.chat.id, message.migrate_to_chat_id)
-
-
-@router.message(Command("groups"))
-async def groups_command(message: Message) -> None:
-    if not await require_admin(message):
-        return
-
-    async with SessionLocal() as session:
-        groups = await get_active_groups(session)
-
-    if not groups:
-        await message.answer(
-            card(
-                title("family", "Ulangan guruhlar"),
-                f"{e('warning')} Hech qanday guruh ulanmagan.\n"
-                "Oilaviy guruh ichida /setgroup yuboring.",
-            )
-        )
-        return
-
-    entries = "\n\n".join(
-        f"{e('family')} <b>{safe(group.title)}</b>\n"
-        f"{e('key')} <code>{group.chat_id}</code>\n"
-        f"{e('alarm')} {group.reminder_time} · {safe(group.timezone)}"
-        for group in groups
-    )
-
-    await message.answer(card(title("family", "Ulangan guruhlar"), entries))
-
-
-# ================================================================
 # TEST VA HOLAT
 # ================================================================
 
 @router.message(Command("testbirthday"))
 async def test_birthday(message: Message, bot: Bot) -> None:
-    if not await require_admin(message):
+    group = await _admin_group(message)
+
+    if group is None:
         return
 
     person_id = _parse_person_id(message)
@@ -1166,71 +1467,48 @@ async def test_birthday(message: Message, bot: Bot) -> None:
         return
 
     async with SessionLocal() as session:
-        person = await _get_active_person(session, person_id)
+        person = await _get_person(session, person_id, group.id)
 
         if person is None:
-            await message.answer(_not_found_text())
+            await message.answer(_not_found_text(group))
             return
 
         person_data = PersonData.from_person(person)
-        groups = await get_active_groups(session)
-
-    if not groups:
-        await message.answer(
-            f"{e('warning')} <b>Eslatma guruhi sozlanmagan.</b>\n\n"
-            "Oilaviy guruh ichida /setgroup yuboring yoki "
-            "<code>TARGET_GROUP_ID</code> ni belgilang."
-        )
-        return
 
     await message.answer(
         f"{e('rocket')} <b>Test tabrigi yuborilmoqda...</b>\n"
-        f"{e('person')} {safe(person_data.full_name)} · "
-        f"{e('people')} {len(groups)} ta guruh"
+        f"{e('person')} {safe(person_data.full_name)} → "
+        f"{e('family')} {safe(group.title)}"
     )
 
-    results = [
-        await send_birthday_greeting(bot, group.chat_id, person_data, local_today())
-        for group in groups
+    result = await send_birthday_greeting(bot, group.chat_id, person_data, local_today())
+
+    lines = [
+        f"{e('check')} Tabrik yuborildi"
+        if result.greeting_sent
+        else f"{e('cross')} Tabrik yuborilmadi"
     ]
 
-    successful = sum(1 for result in results if result.greeting_sent)
+    if result.music_sent:
+        lines.append(f"{e('music')} Musiqa yuborildi")
+    elif person_data.music_file_id and result.greeting_sent:
+        lines.append(f"{e('warning')} Musiqa yuborilmadi")
 
-    lines = []
+    if result.error:
+        lines.append(f"{e('warning')} <code>{safe(result.error[:300])}</code>")
 
-    for index, result in enumerate(results, start=1):
-        status = (
-            f"{e('check')} Tabrik yuborildi"
-            if result.greeting_sent
-            else f"{e('cross')} Tabrik yuborilmadi"
-        )
-        line = f"<b>{index}.</b> <code>{result.chat_id}</code>\n{status}"
+    if result.music_error:
+        lines.append(f"{e('music')} <code>{safe(result.music_error[:300])}</code>")
 
-        if result.music_sent:
-            line += f"\n{e('music')} Musiqa yuborildi"
-        elif person_data.music_file_id and result.greeting_sent:
-            line += f"\n{e('warning')} Musiqa yuborilmadi"
-
-        if result.error:
-            line += f"\n{e('warning')} <code>{safe(result.error[:250])}</code>"
-
-        if result.music_error:
-            line += f"\n{e('music')} <code>{safe(result.music_error[:250])}</code>"
-
-        lines.append(line)
-
-    await _send_long_text(
-        message,
+    await message.answer(
         card(
             title("sparkles", "Test natijasi"),
             row("person", "Inson", f"<b>{safe(person_data.full_name)}</b>")
             + "\n"
-            + row("check", "Muvaffaqiyatli", f"<b>{successful}</b>")
-            + "\n"
-            + row("cross", "Xatolik", f"<b>{len(results) - successful}</b>"),
+            + _group_line(group),
             DIVIDER,
-            "\n\n".join(lines),
-        ),
+            "\n".join(lines),
+        )
     )
 
 
@@ -1241,8 +1519,11 @@ async def status_command(message: Message) -> None:
 
     try:
         async with SessionLocal() as session:
-            active_count = len(await list_people(session))
-            groups = await get_active_groups(session)
+            groups = await _active_groups(session)
+            selected = await _selected_group(session, message.from_user.id)
+            active_count = await session.scalar(
+                select(func.count(Person.id)).where(Person.is_active.is_(True))
+            )
 
     except Exception:
         logger.exception("Ma'lumotlar bazasi holatini tekshirishda xato")
@@ -1260,9 +1541,15 @@ async def status_command(message: Message) -> None:
             title("chart", "Bot holati"),
             f"{e('check')} Bot: ishlayapti\n"
             f"{e('check')} Ma'lumotlar bazasi: ulandi",
-            row("people", "Faol insonlar", f"<b>{active_count}</b>")
+            row("family", "Faol guruhlar", f"<b>{len(groups)}</b>")
             + "\n"
-            + row("family", "Faol guruhlar", f"<b>{len(groups)}</b>")
+            + row("people", "Jami insonlar", f"<b>{active_count or 0}</b>")
+            + "\n"
+            + row(
+                "target",
+                "Tanlangan guruh",
+                f"<b>{safe(selected.title)}</b>" if selected else "tanlanmagan",
+            )
             + "\n"
             + row("alarm", "Eslatma vaqti", f"<code>{settings.birthday_reminder_time}</code>")
             + "\n"

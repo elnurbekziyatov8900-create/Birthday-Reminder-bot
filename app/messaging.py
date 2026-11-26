@@ -20,11 +20,11 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from aiogram.types import ReplyParameters
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import GroupConfig, NotificationLog
+from app.models import GroupConfig, NotificationLog, Person
 from app.services import (
     PersonData,
     make_greeting,
@@ -113,6 +113,7 @@ def split_html_text(text: str, limit: int = SAFE_TEXT_LIMIT) -> list[str]:
 
 @dataclass(frozen=True, slots=True)
 class GroupTarget:
+    id: int | None
     chat_id: int
     title: str
     timezone: str
@@ -120,12 +121,10 @@ class GroupTarget:
 
 
 async def get_active_groups(session) -> list[GroupTarget]:
-    """Bazadagi faol guruhlar.
+    """Bazadagi faol guruhlar (har birining o'z oila jadvali bor).
 
-    Bazada birorta ham faol guruh bo'lmasa, ``.env`` dagi
-    ``TARGET_GROUP_ID`` zaxira sifatida ishlatiladi. Avval ikkalasi
-    birlashtirilardi — natijada /setgroup orqali guruh almashtirilganda
-    ham tabriklar eski guruhga borishda davom etardi.
+    ``.env`` dagi ``TARGET_GROUP_ID`` faqat bazada birorta ham guruh
+    bo'lmaganda birinchi guruh sifatida qo'shiladi (``init_db``).
     """
 
     result = await session.scalars(
@@ -136,6 +135,7 @@ async def get_active_groups(session) -> list[GroupTarget]:
 
     groups = [
         GroupTarget(
+            id=config.id,
             chat_id=config.chat_id,
             title=config.title,
             timezone=config.timezone,
@@ -143,16 +143,6 @@ async def get_active_groups(session) -> list[GroupTarget]:
         )
         for config in result.all()
     ]
-
-    if not groups and settings.target_group_id:
-        groups.append(
-            GroupTarget(
-                chat_id=settings.target_group_id,
-                title="TARGET_GROUP_ID",
-                timezone=settings.timezone,
-                reminder_time=settings.birthday_reminder_time,
-            )
-        )
 
     return groups
 
@@ -169,11 +159,20 @@ async def migrate_group_chat_id(old_chat_id: int, new_chat_id: int) -> None:
             select(GroupConfig).where(GroupConfig.chat_id == new_chat_id)
         )
 
-        if existing_new is not None:
+        old_config = await session.scalar(
+            select(GroupConfig).where(GroupConfig.chat_id == old_chat_id)
+        )
+
+        if existing_new is not None and old_config is not None:
+            # Ikkala yozuv ham bor: insonlarni yangi guruhga ko'chirib,
+            # eski yozuvni o'chiramiz.
             existing_new.is_active = True
             await session.execute(
-                delete(GroupConfig).where(GroupConfig.chat_id == old_chat_id)
+                update(Person)
+                .where(Person.group_id == old_config.id)
+                .values(group_id=existing_new.id)
             )
+            await session.delete(old_config)
         else:
             await session.execute(
                 update(GroupConfig)
