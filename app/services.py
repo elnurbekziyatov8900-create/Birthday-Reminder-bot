@@ -119,52 +119,110 @@ def format_day_month_uz(value: date) -> str:
 # TABRIK MATNI
 # ================================================================
 
-def _special_wish(age: int) -> str:
-    if age <= 12:
-        return (
-            "Bolalik olamingiz doimo quvonch va beg'ubor kulguga to'lsin. "
-            "Har bir orzuingiz ushalib, har yangi kun sizga qiziqarli "
-            "kashfiyotlar olib kelsin."
-        )
+# Har bir yosh guruhi uchun bir nechta samimiy tilak. Har yili (va har
+# bir inson uchun) boshqa variant tanlanadi — tabriklar bir xil takrorlanib,
+# "robotdek" ko'rinmasligi uchun.
+WISHES: dict[str, tuple[str, ...]] = {
+    "child": (
+        "Jajji quvonchimiz! Sen bilan uyimiz yanada yorug', kunlarimiz "
+        "yanada shirin. Doim sog'-salomat bo'l, katta-katta orzularing "
+        "ushalsin, beg'ubor kulging hech qachon so'nmasin!",
+        "Oilamizning erkatoyi! Sening ulg'ayib borayotganingni ko'rish biz "
+        "uchun eng katta baxt. Aqlli, odobli va baxtli bo'lib o'sgin, har "
+        "bir kuning o'yin-kulgu va yangi kashfiyotlarga to'la bo'lsin!",
+    ),
+    "teen": (
+        "Yoshlikning eng go'zal pallasidasiz. Orzularingiz baland, "
+        "yo'lingiz ochiq bo'lsin. O'qishda, hayotda va boshlagan har bir "
+        "ishingizda omad yor bo'lib, biz doim sizdan faxrlanib yuraylik!",
+        "Har bir yangi yosh — yangi imkoniyat. Ishonchingiz mustahkam, "
+        "qadamingiz dadil bo'lsin. Do'stlaringiz sadoqatli, ustozlaringiz "
+        "mamnun, ota-onangiz esa doim sizdan rozi bo'lsin!",
+    ),
+    "young": (
+        "Siz oilamizning faxri va tayanchisiz. Hayotingizdagi har bir kun "
+        "mazmunli, har bir qadamingiz barakali bo'lsin. Niyat qilgan "
+        "maqsadlaringizga yetib, xonadoningiz fayz va quvonchga to'lsin!",
+        "Yangi yoshingiz sizga yangi kuch, yangi ilhom va yangi "
+        "g'alabalar olib kelsin. Mehnatingiz samarasini ko'rib, "
+        "yaqinlaringiz bilan baxtli damlarni ko'p bor baham ko'ring!",
+    ),
+    "adult": (
+        "Siz oilamizning mehribon tayanchi va iliq qalbisiz. Bergan "
+        "mehringiz, qilgan yaxshiliklaringiz o'n chandon bo'lib qaytsin. "
+        "Sog'lik, xotirjamlik va farzandlar rohatini ko'rib yuring!",
+        "Bosib o'tgan har bir yilingiz biz uchun ibrat. Dasturxoningiz "
+        "to'kin, uyingiz fayzli, ko'nglingiz doim tinch bo'lsin. "
+        "Yaqinlaringizning duosi va mehri sizni hamisha asrasin!",
+    ),
+    "elder": (
+        "Siz oilamizning duoli boshi, eng aziz insonimizsiz. Umringiz "
+        "uzoq, sog'lig'ingiz mustahkam bo'lsin. Farzandlar va nevaralar "
+        "kamolini ko'rib, ularning mehri qurshovida baxtiyor yashang!",
+        "Sizning duolaringiz — oilamizning eng katta boyligi. Alloh sizga "
+        "uzoq umr, sihat-salomatlik va qalb xotirjamligini ato etsin. Har "
+        "bir kuningiz quvonch va hurmat bilan o'tsin!",
+    ),
+}
 
-    if age <= 19:
-        return (
-            "Yoshlik davringiz unutilmas lahzalar, dadil orzular va "
-            "yuksak natijalarga boy bo'lsin. Tanlagan yo'lingizda "
-            "ishonch bilan olg'a boring."
-        )
-
-    if age <= 35:
-        return (
-            "Oldingizga qo'ygan maqsadlaringiz birin-ketin amalga oshsin. "
-            "Har bir yangi kun sizga yangi imkoniyat, xonadoningizga "
-            "esa fayz va xotirjamlik olib kelsin."
-        )
-
-    return (
-        "Umringiz uzoq, taningiz sog', ko'nglingiz xotirjam bo'lsin. "
-        "Yaqinlaringiz mehrini, farzandlar kamolini ko'rib, hayotning "
-        "go'zal onlaridan bahramand bo'lib yuring."
-    )
-
-
-POEM_LINES = (
-    "Yuzingizdan arimasin kulgu, shodlik,",
-    "Har kuningiz olib kelsin baxt, omad.",
-    "Ko'nglingizda yashnasin doim ezgulik,",
-    "Umringizga hamroh bo'lsin saodat.",
+POEMS: tuple[tuple[str, ...], ...] = (
+    (
+        "Yuzingizdan arimasin kulgu, shodlik,",
+        "Har kuningiz olib kelsin baxt, omad.",
+        "Ko'nglingizda yashnasin doim ezgulik,",
+        "Umringizga hamroh bo'lsin saodat.",
+    ),
+    (
+        "Gullar kabi yashnasin har bir kuningiz,",
+        "Quyosh kabi porlasin yorug' yuzingiz.",
+        "Baxt-u omad hamisha bo'lsin yo'ldoshingiz,",
+        "Doim baland bo'lsin, aziz, boshingiz.",
+    ),
+    (
+        "Bugun sizning kuningiz, olam to'la quvonch,",
+        "Yaqinlaringiz mehri — eng ishonchli tayanch.",
+        "Har yangi tong sizga nur va omad keltirsin,",
+        "Qalbingizdagi orzular birma-bir ushalsin.",
+    ),
 )
 
 
-def make_greeting_caption(person: Person | PersonData, today: date) -> str:
-    """Surat ostiga qo'yiladigan qisqa (1024 belgidan kam) sarlavha."""
+# Bolalarga "sen" deb, erkalab murojaat qilinadi.
+CHILD_POEM: tuple[str, ...] = (
+    "Gullar kabi yashnasin har bir kuning,",
+    "Quyosh kabi porlasin yorug' yuzing.",
+    "Baxt-u omad hamisha bo'lsin yo'ldoshing,",
+    "Kulib tursin doimo shirin so'zing.",
+)
 
-    age = age_on(person.birth_date, today)
+
+def _age_group(age: int) -> str:
+    if age <= 12:
+        return "child"
+    if age <= 19:
+        return "teen"
+    if age <= 35:
+        return "young"
+    if age <= 59:
+        return "adult"
+    return "elder"
+
+
+def _pick(options: tuple, person_id: int, year: int, salt: int = 0):
+    # Tasodifiy emas, balki barqaror tanlov: qayta urinishda ham, test va
+    # haqiqiy tabrikda ham bir xil matn chiqadi.
+    return options[(person_id * 7 + year + salt) % len(options)]
+
+
+def make_greeting_caption(person: Person | PersonData, today: date) -> str:
+    """Juda uzun ism bo'lgan holat uchun qisqa sarlavha."""
+
+    age = turning_age(person.birth_date, today)
 
     return (
-        f"{e('confetti')} {e('cake')} {e('confetti')}\n"
-        f"<b>{safe(person.full_name)}</b>\n"
-        f"{e('balloon')} <b>{age} yoshingiz muborak!</b> {e('balloon')}"
+        f"{e('party')} <b>Bugun oilamizning quvonchli kuni!</b> {e('party')}\n\n"
+        f"{e('balloon')} <b>{safe(person.full_name)}</b> bugun "
+        f"<b>{age} yoshni</b> qarshi olmoqda! {e('partying_face')}"
     )
 
 
@@ -173,49 +231,54 @@ def make_greeting(
     today: date,
     compact: bool = False,
 ) -> str:
-    """To'liq tabrik matni.
+    """Samimiy tabrik matni.
 
-    ``compact=True`` bo'lsa to'rtlik qismi tushirib qoldiriladi — juda uzun
-    ism bilan ham matn surat ostiga (1024 belgi) sig'ishi uchun.
+    ``compact=True`` bo'lsa she'r tushirib qoldiriladi — juda uzun ism
+    bilan ham matn surat ostiga (1024 belgi) sig'ishi uchun.
     """
 
     name = safe(person.full_name)
-    age = age_on(person.birth_date, today)
-    poem = "\n".join(safe(line) for line in POEM_LINES)
+    # Tug'ilgan kunning o'zida bu bugungi yosh; /testbirthday boshqa kuni
+    # ishlatilsa ham navbatdagi (to'ladigan) yosh ko'rsatiladi.
+    age = turning_age(person.birth_date, today)
+    group = _age_group(age)
+    is_child = group == "child"
 
-    poem_section = (
-        ""
-        if compact
-        else (
-            f"{e('bouquet')} <b>Siz uchun samimiy to'rtlik</b>\n"
-            + quote(f"<i>{poem}</i>")
-            + "\n\n"
-        )
+    wish = _pick(WISHES[group], person.id, today.year)
+    poem_lines = (
+        CHILD_POEM if is_child else _pick(POEMS, person.id, today.year, 1)
     )
+    poem = "\n".join(safe(line) for line in poem_lines)
+
+    address = "Muhtaram" if group == "elder" else "Aziz"
+    signature = (
+        "Seni juda yaxshi ko'radigan oilang"
+        if is_child
+        else "Sizni chin dildan sevuvchi oilangiz"
+    )
+    closing = (
+        "Tug'ilgan kuning muborak, jonim!"
+        if is_child
+        else "Tavallud kuningiz muborak bo'lsin!"
+    )
+
+    poem_section = "" if compact else quote(f"<i>{poem}</i>") + "\n\n"
 
     return (
         f"{e('confetti')}{e('party')}{e('cake')}{e('party')}{e('confetti')}\n"
-        f"<b>TAVALLUD KUNINGIZ MUBORAK!</b>\n"
+        "<b>Bugun oilamizning quvonchli kuni!</b>\n"
         f"{DIVIDER}\n"
         "\n"
-        f"{e('crown')} <b>{name}</b>\n"
-        f"{e('balloon')} Bugun siz <b>{age} yoshga</b> to'ldingiz!\n"
-        f"{e('calendar')} {format_date_uz(person.birth_date)}\n"
+        f"{e('balloon')} {address} <b>{name}</b> bugun "
+        f"<b>{age} yoshni</b> qarshi olmoqda! {e('partying_face')}\n"
         "\n"
-        f"{e('sparkles')} <b>Eng ezgu tilaklarimiz</b>\n"
-        + quote(
-            "Sizga mustahkam sog'liq, qalb xotirjamligi, oilaviy baxt, "
-            "baraka va barcha ezgu niyatlaringiz ro'yobini tilaymiz.\n\n"
-            f"{_special_wish(age)}\n\n"
-            "Har doim yaqinlaringiz ardog'ida, mehr va e'tibor "
-            "qurshovida bo'ling!"
-        )
+        f"{e('sparkling_heart')} <b>Qalbimizdan chiqqan tilaklar:</b>\n"
+        + quote(safe(wish))
         + "\n\n"
         + poem_section
         + f"{DIVIDER}\n"
-        f"{e('heart_gift')} {hint('Oilamiz nomidan cheksiz mehr bilan')}\n"
-        f"{e('trophy')} <b>Yangi yoshingiz yangi zafarlar olib kelsin!</b> "
-        f"{e('glowing_star')}"
+        f"{e('bouquet')} <b>{closing}</b>\n"
+        f"{e('heart')} {hint(signature)}"
     )
 
 
