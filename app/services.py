@@ -176,7 +176,7 @@ POEMS: tuple[tuple[str, ...], ...] = (
         "Gullar kabi yashnasin har bir kuningiz,",
         "Quyosh kabi porlasin yorug' yuzingiz.",
         "Baxt-u omad hamisha bo'lsin yo'ldoshingiz,",
-        "Doim baland bo'lsin, aziz, boshingiz.",
+        "Hamisha baland bo'lsin boshingiz.",
     ),
     (
         "Bugun sizning kuningiz, olam to'la quvonch,",
@@ -186,7 +186,6 @@ POEMS: tuple[tuple[str, ...], ...] = (
     ),
 )
 
-
 # Bolalarga "sen" deb, erkalab murojaat qilinadi.
 CHILD_POEM: tuple[str, ...] = (
     "Gullar kabi yashnasin har bir kuning,",
@@ -194,6 +193,33 @@ CHILD_POEM: tuple[str, ...] = (
     "Baxt-u omad hamisha bo'lsin yo'ldoshing,",
     "Kulib tursin doimo shirin so'zing.",
 )
+
+# 40 yoshdan kattalar uchun — hurmat va ehtirom ruhidagi she'rlar.
+MATURE_POEMS: tuple[tuple[str, ...], ...] = (
+    (
+        "Siz bizning g'ururimiz, oilamiz chirog'i,",
+        "Mehringiz — xonadonning eng iliq quchog'i.",
+        "Umringiz uzoq bo'lsin, ko'nglingiz doim butun,",
+        "Har kuningiz bayramdek o'tsin xuddi bugun.",
+    ),
+    (
+        "Bosib o'tgan yo'llaringiz nurga to'lsin,",
+        "Har bir aytgan duongiz ijobat bo'lsin.",
+        "Farzandlar kamolidan ko'nglingiz to'lsin,",
+        "Umringiz uzoq, baxtingiz bardavom bo'lsin.",
+    ),
+)
+
+# 50 yoshdan kattalar uchun qo'shimcha she'r.
+ELDER_POEM: tuple[str, ...] = (
+    "Har bir oq tolangizda hikmat bor, sabr bor,",
+    "Har bir duoingizda oilaga madad bor.",
+    "Nevaralar kulgusi qalbingizga nur bo'lsin,",
+    "Umringiz uzoq bo'lib, dasturxoningiz to'lsin.",
+)
+
+RESPECT_AGE = 40  # shu yoshdan boshlab "Muhtaram" deb murojaat qilinadi
+ELDER_POEM_AGE = 50  # shu yoshdan boshlab qo'shimcha she'r qo'shiladi
 
 
 def _age_group(age: int) -> str:
@@ -214,14 +240,40 @@ def _pick(options: tuple, person_id: int, year: int, salt: int = 0):
     return options[(person_id * 7 + year + salt) % len(options)]
 
 
+def _display_name(full_name: str, age: int) -> str:
+    name = f"<b>{safe(full_name)}</b>"
+    return f"Muhtaram {name}" if age >= RESPECT_AGE else name
+
+
+def _poems_for(age: int, person_id: int, year: int) -> list[tuple[str, ...]]:
+    if age <= 12:
+        return [CHILD_POEM]
+
+    if age < RESPECT_AGE:
+        return [_pick(POEMS, person_id, year, 1)]
+
+    poems = [_pick(MATURE_POEMS, person_id, year, 1)]
+
+    if age >= ELDER_POEM_AGE:
+        poems.append(ELDER_POEM)
+
+    return poems
+
+
+def _divider() -> str:
+    return f"{e('sparkles')} ┈┈┈┈┈┈┈┈┈┈┈┈┈┈ {e('sparkles')}"
+
+
 def make_greeting_caption(person: Person | PersonData, today: date) -> str:
     """Juda uzun ism bo'lgan holat uchun qisqa sarlavha."""
 
     age = turning_age(person.birth_date, today)
 
     return (
-        f"{e('party')} <b>Bugun oilamizning quvonchli kuni!</b> {e('party')}\n\n"
-        f"{e('balloon')} <b>{safe(person.full_name)}</b> bugun "
+        f"{e('fireworks')} <b>Bugun oilamizning quvonchli kuni!</b> "
+        f"{e('fireworks')}\n\n"
+        f"{e('crown') if age >= RESPECT_AGE else e('glowing_star')} "
+        f"{_display_name(person.full_name, age)} bugun "
         f"<b>{age} yoshni</b> qarshi olmoqda! {e('partying_face')}"
     )
 
@@ -233,52 +285,66 @@ def make_greeting(
 ) -> str:
     """Samimiy tabrik matni.
 
-    ``compact=True`` bo'lsa she'r tushirib qoldiriladi — juda uzun ism
+    ``compact=True`` bo'lsa she'rlar tushirib qoldiriladi — juda uzun ism
     bilan ham matn surat ostiga (1024 belgi) sig'ishi uchun.
     """
 
-    name = safe(person.full_name)
     # Tug'ilgan kunning o'zida bu bugungi yosh; /testbirthday boshqa kuni
     # ishlatilsa ham navbatdagi (to'ladigan) yosh ko'rsatiladi.
     age = turning_age(person.birth_date, today)
     group = _age_group(age)
     is_child = group == "child"
+    respected = age >= RESPECT_AGE
 
     wish = _pick(WISHES[group], person.id, today.year)
-    poem_lines = (
-        CHILD_POEM if is_child else _pick(POEMS, person.id, today.year, 1)
-    )
-    poem = "\n".join(safe(line) for line in poem_lines)
 
-    address = "Muhtaram" if group == "elder" else "Aziz"
-    signature = (
-        "Seni juda yaxshi ko'radigan oilang"
-        if is_child
-        else "Sizni chin dildan sevuvchi oilangiz"
-    )
-    closing = (
-        "Tug'ilgan kuning muborak, jonim!"
-        if is_child
-        else "Tavallud kuningiz muborak bo'lsin!"
-    )
+    if is_child:
+        badge, poem_icon, poem_title = e("teddy"), e("rainbow"), "Sen uchun she'r"
+        closing = "Tug'ilgan kuning muborak, jonim!"
+        signature = "Seni juda yaxshi ko'radigan oilang"
+    elif respected:
+        badge, poem_icon, poem_title = e("crown"), e("rose"), "Siz uchun she'r"
+        closing = "Tavallud kuningiz muborak bo'lsin!"
+        signature = "Sizni chin dildan hurmat qiluvchi oilangiz"
+    else:
+        badge, poem_icon, poem_title = e("glowing_star"), e("blossom"), "Siz uchun she'r"
+        closing = "Tavallud kuningiz muborak bo'lsin!"
+        signature = "Sizni chin dildan sevuvchi oilangiz"
 
-    poem_section = "" if compact else quote(f"<i>{poem}</i>") + "\n\n"
+    poem_section = ""
+
+    if not compact:
+        poems = _poems_for(age, person.id, today.year)
+
+        if len(poems) > 1:
+            poem_title = "Siz uchun she'rlar"
+
+        poem_section = (
+            f"{poem_icon} <b>{poem_title}</b>\n"
+            + "\n".join(
+                quote("<i>" + "\n".join(safe(line) for line in poem) + "</i>")
+                for poem in poems
+            )
+            + "\n\n"
+        )
 
     return (
-        f"{e('confetti')}{e('party')}{e('cake')}{e('party')}{e('confetti')}\n"
-        "<b>Bugun oilamizning quvonchli kuni!</b>\n"
-        f"{DIVIDER}\n"
+        f"{e('balloon')}{e('confetti')}{e('party')}{e('cake')}"
+        f"{e('party')}{e('confetti')}{e('balloon')}\n"
+        f"{e('fireworks')} <b>Bugun oilamizning quvonchli kuni!</b> "
+        f"{e('fireworks')}\n"
+        f"{_divider()}\n"
         "\n"
-        f"{e('balloon')} {address} <b>{name}</b> bugun "
+        f"{badge} {_display_name(person.full_name, age)} bugun "
         f"<b>{age} yoshni</b> qarshi olmoqda! {e('partying_face')}\n"
         "\n"
         f"{e('sparkling_heart')} <b>Qalbimizdan chiqqan tilaklar:</b>\n"
         + quote(safe(wish))
         + "\n\n"
         + poem_section
-        + f"{DIVIDER}\n"
-        f"{e('bouquet')} <b>{closing}</b>\n"
-        f"{e('heart')} {hint(signature)}"
+        + f"{_divider()}\n"
+        f"{e('gift')} <b>{closing}</b> {e('cake')}\n"
+        f"{e('heart_hands')} {hint(signature)} {e('heart')}"
     )
 
 
