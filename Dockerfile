@@ -1,4 +1,4 @@
-﻿FROM python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -10,5 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY media ./media
+COPY alembic ./alembic
+COPY alembic.ini .
 
-CMD ["python", "-m", "app.main"]
+# Avval baza sxemasi yangilanadi, keyin bot ishga tushadi.
+CMD ["sh", "-c", "alembic upgrade head && python -m app.main"]

@@ -1,399 +1,209 @@
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from __future__ import annotations
 
+import logging
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models import NotificationLog, GroupConfig
-from app.services import (
-    local_today,
-    birthdays_today,
-    make_greeting,
-    already_notified,
-)
+from app.messaging import GroupTarget, get_active_groups, send_birthday_greeting
+from app.models import NotificationLog
+from app.services import PersonData, birthdays_today
 
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# PREMIUM CUSTOM EMOJI
-# ============================================================
-
-PREMIUM_PARTY_EMOJI = (
-    '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
-)
+# Muvaffaqiyatsiz yuborishni bir kunda necha marta va qanday oraliqda
+# qayta urinish. Avval xato bo'lsa bot har daqiqada qayta urinardi.
+MAX_ATTEMPTS_PER_DAY = 5
+RETRY_INTERVAL = timedelta(minutes=10)
 
 
-async def send_daily_birthdays(bot) -> None:
-    """
-    Bugun tug‘ilgan kuni bo‘lgan insonlarga tabrik yuboradi.
+def _parse_reminder_time(value: str) -> tuple[int, int]:
+    try:
+        hour, minute = map(int, value.split(":"))
+    except (ValueError, AttributeError):
+        raise ValueError(f"Noto'g'ri reminder_time: {value}") from None
 
-    Yuborish tartibi:
-    1. Alohida Premium Custom Emoji.
-    2. Asosiy tug‘ilgan kun tabrigi.
-    3. Tabrik musiqasi.
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"Noto'g'ri reminder_time: {value}")
 
-    Natijalar NotificationLog orqali qayd etiladi.
-    """
+    return hour, minute
 
-    today = local_today()
 
-    logger.info(
-        "Tug‘ilgan kunlarni tekshirish boshlandi: %s",
-        today,
+def _get_group_timezone(value: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(f"Noto'g'ri timezone: {value}") from None
+
+
+def _normalize(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value
+
+
+async def _get_log(
+    session,
+    person_id: int,
+    birthday_year: int,
+    chat_id: int,
+) -> NotificationLog | None:
+    return await session.scalar(
+        select(NotificationLog).where(
+            NotificationLog.person_id == person_id,
+            NotificationLog.birthday_year == birthday_year,
+            NotificationLog.chat_id == chat_id,
+        )
     )
 
+
+def _should_attempt(log_entry: NotificationLog | None, now: datetime) -> bool:
+    if log_entry is None:
+        return True
+
+    if log_entry.status == "sent":
+        return False
+
+    if (log_entry.attempts or 0) >= MAX_ATTEMPTS_PER_DAY:
+        return False
+
+    last_attempt = _normalize(log_entry.last_attempt_at)
+
+    return last_attempt is None or now - last_attempt >= RETRY_INTERVAL
+
+
+async def _process_group(bot: Bot, group: GroupTarget) -> None:
+    chat_id = group.chat_id
+
+    try:
+        group_timezone = _get_group_timezone(group.timezone)
+        hour, minute = _parse_reminder_time(group.reminder_time)
+    except ValueError:
+        logger.exception("Guruh sozlamalari noto'g'ri: chat_id=%s", chat_id)
+        return
+
+    now_local = datetime.now(group_timezone)
+
+    if (now_local.hour, now_local.minute) < (hour, minute):
+        return
+
+    today = now_local.date()
+    now_utc = datetime.now(timezone.utc)
+
     async with SessionLocal() as session:
+        # ORM obyektlaridan nusxa olamiz: keyingi commit'lar ularni
+        # "expire" qiladi va async rejimda lazy-load xatosi chiqardi.
+        people = [
+            PersonData.from_person(person)
+            for person in await birthdays_today(session, today)
+        ]
 
-        # ====================================================
-        # 1. BUGUN TUG‘ILGAN KUN BO‘LGAN INSONLARNI OLISH
-        # ====================================================
+    if not people:
+        return
 
-        people = await birthdays_today(session, today)
+    for person in people:
+        try:
+            async with SessionLocal() as session:
+                log_entry = await _get_log(session, person.id, today.year, chat_id)
 
-        if not people:
-            logger.info(
-                "Bugun tug‘ilgan kuni bo‘lgan insonlar topilmadi."
-            )
-            return
-
-        # ====================================================
-        # 2. FAOL GURUHLARNI ANIQLASH
-        # ====================================================
-
-        result = await session.scalars(
-            select(GroupConfig).where(
-                GroupConfig.is_active.is_(True)
-            )
-        )
-
-        configs = list(result.all())
-
-        target_ids = list(
-            dict.fromkeys(config.chat_id for config in configs)
-        )
-
-        if settings.target_group_id:
-            if settings.target_group_id not in target_ids:
-                target_ids.append(settings.target_group_id)
-
-        if not target_ids:
-            logger.warning(
-                "Tabrik yuborish uchun guruh topilmadi. "
-                "TARGET_GROUP_ID yoki /setgroup sozlamasini tekshiring."
-            )
-            return
-
-        logger.info(
-            "Bugungi tug‘ilgan kunlar: %s ta, "
-            "maqsadli guruhlar: %s ta",
-            len(people),
-            len(target_ids),
-        )
-
-        # ====================================================
-        # 3. HAR BIR INSON UCHUN TABRIK YUBORISH
-        # ====================================================
-
-        for person in people:
-
-            # Avval muvaffaqiyatli yuborilgan tabrikni takrorlamaymiz.
-            if await already_notified(
-                session,
-                person.id,
-                today.year,
-            ):
-                logger.info(
-                    "Tabrik avval muvaffaqiyatli qayd etilgan: "
-                    "person_id=%s, year=%s",
-                    person.id,
-                    today.year,
-                )
-                continue
-
-            text = make_greeting(person, today)
-
-            sent_message_id = None
-
-            successful_targets = 0
-            failed_targets = []
-            failed_emoji_targets = []
-
-            # =================================================
-            # 4. HAR BIR GURUHGA XABAR YUBORISH
-            # =================================================
-
-            for chat_id in target_ids:
-
-                # ---------------------------------------------
-                # 4.1. AVVAL PREMIUM EMOJI YUBORILADI
-                # ---------------------------------------------
-
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=PREMIUM_PARTY_EMOJI,
-                        parse_mode="HTML",
-                    )
-
-                    logger.info(
-                        "Premium bayram emojisi yuborildi: "
-                        "person_id=%s, chat_id=%s",
-                        person.id,
-                        chat_id,
-                    )
-
-                except Exception:
-                    failed_emoji_targets.append(chat_id)
-
-                    logger.exception(
-                        "Premium emoji yuborilmadi: "
-                        "person_id=%s, chat_id=%s",
-                        person.id,
-                        chat_id,
-                    )
-
-                # ---------------------------------------------
-                # 4.2. ASOSIY TABRIK YUBORILADI
-                # ---------------------------------------------
-
-                try:
-
-                    if person.photo_file_id:
-
-                        sent = await bot.send_photo(
-                            chat_id=chat_id,
-                            photo=person.photo_file_id,
-                            caption=text,
-                            parse_mode="HTML",
-                        )
-
-                    else:
-
-                        sent = await bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode="HTML",
-                        )
-
-                    sent_message_id = sent.message_id
-                    successful_targets += 1
-
-                    logger.info(
-                        "Asosiy tabrik yuborildi: "
-                        "person_id=%s, chat_id=%s",
-                        person.id,
-                        chat_id,
-                    )
-
-                except Exception:
-
-                    failed_targets.append(chat_id)
-
-                    logger.exception(
-                        "Asosiy tabrik yuborilmadi: "
-                        "person_id=%s, chat_id=%s",
-                        person.id,
-                        chat_id,
-                    )
-
+                if not _should_attempt(log_entry, now_utc):
                     continue
 
-                # ---------------------------------------------
-                # 4.3. TABRIK MUSIQASI YUBORILADI
-                # ---------------------------------------------
-
-                if person.music_file_id:
-
-                    try:
-
-                        await bot.send_audio(
-                            chat_id=chat_id,
-                            audio=person.music_file_id,
-                            caption=(
-                                f"🎵 {person.full_name} "
-                                "uchun tabrik musiqasi"
-                            ),
-                        )
-
-                        logger.info(
-                            "Tabrik musiqasi yuborildi: "
-                            "person_id=%s, chat_id=%s",
-                            person.id,
-                            chat_id,
-                        )
-
-                    except Exception:
-
-                        logger.exception(
-                            "Tabrik musiqasi yuborilmadi: "
-                            "person_id=%s, chat_id=%s",
-                            person.id,
-                            chat_id,
-                        )
-
-            # =================================================
-            # 5. NATIJANI NOTIFICATION LOG GA SAQLASH
-            # =================================================
-
-            try:
-
-                log_entry = await session.scalar(
-                    select(NotificationLog).where(
-                        NotificationLog.person_id == person.id,
-                        NotificationLog.birthday_year == today.year,
-                    )
+                logger.info(
+                    "Tabrik yuborilmoqda: person_id=%s, chat_id=%s, date=%s",
+                    person.id,
+                    chat_id,
+                    today,
                 )
 
-                # Asosiy tabrik yuborilish holati.
-                if successful_targets == len(target_ids):
+                result = await send_birthday_greeting(bot, chat_id, person, today)
 
-                    status = "sent"
-
-                elif successful_targets > 0:
-
-                    status = "partial"
-
-                else:
-
-                    status = "failed"
-
-                # Xatoliklarni qayd etish.
-                error_messages = []
-
-                if failed_targets:
-                    error_messages.append(
-                        "Asosiy tabrik yuborilmagan guruhlar: "
-                        f"{failed_targets}"
+                # Guruh superguruhga ko'chgan bo'lsa, yangi ID bo'yicha yozamiz.
+                if result.chat_id != chat_id:
+                    chat_id = result.chat_id
+                    log_entry = await _get_log(
+                        session, person.id, today.year, chat_id
                     )
 
-                if failed_emoji_targets:
-                    error_messages.append(
-                        "Premium emoji yuborilmagan guruhlar: "
-                        f"{failed_emoji_targets}"
-                    )
-
-                error_message = (
-                    "\n".join(error_messages)[:2000]
-                    if error_messages
-                    else None
-                )
-
-                sent_at = (
-                    datetime.now(ZoneInfo(settings.timezone))
-                    if successful_targets > 0
-                    else None
-                )
-
-                # Mavjud logni yangilash yoki yangi yaratish.
                 if log_entry is None:
-
                     log_entry = NotificationLog(
                         person_id=person.id,
                         birthday_year=today.year,
-                        status=status,
-                        telegram_message_id=sent_message_id,
-                        sent_at=sent_at,
-                        error_message=error_message,
+                        chat_id=chat_id,
+                        attempts=0,
                     )
-
                     session.add(log_entry)
 
-                else:
+                log_entry.attempts = (log_entry.attempts or 0) + 1
+                log_entry.last_attempt_at = now_utc
 
-                    log_entry.status = status
-                    log_entry.telegram_message_id = sent_message_id
-                    log_entry.sent_at = sent_at
-                    log_entry.error_message = error_message
+                if result.greeting_sent:
+                    log_entry.status = "sent"
+                    log_entry.sent_at = now_utc
+                    log_entry.telegram_message_id = result.message_id
+                    log_entry.error_message = result.music_error
+                    logger.info(
+                        "Tabrik yuborildi: person_id=%s, chat_id=%s",
+                        person.id,
+                        chat_id,
+                    )
+                else:
+                    log_entry.status = "failed"
+                    log_entry.error_message = result.error
 
                 await session.commit()
 
-                logger.info(
-                    "Yuborish natijasi bazaga saqlandi: "
-                    "person_id=%s, status=%s, "
-                    "muvaffaqiyatli=%s, asosiy_xatolik=%s, "
-                    "emoji_xatolik=%s",
-                    person.id,
-                    status,
-                    successful_targets,
-                    len(failed_targets),
-                    len(failed_emoji_targets),
-                )
-
-            except Exception:
-
-                await session.rollback()
-
-                logger.exception(
-                    "NotificationLog saqlanmadi: person_id=%s",
-                    person.id,
-                )
-
-    logger.info(
-        "Tug‘ilgan kunlarni tekshirish yakunlandi."
-    )
+        except Exception:
+            logger.exception(
+                "Tabrikni qayta ishlashda xatolik: person_id=%s, chat_id=%s",
+                person.id,
+                chat_id,
+            )
 
 
-# ============================================================
-# APSCHEDULER SETUP
-# ============================================================
+async def send_daily_birthdays(bot: Bot) -> None:
+    async with SessionLocal() as session:
+        groups = await get_active_groups(session)
 
-def setup_scheduler(bot) -> AsyncIOScheduler:
-    """
-    Tug‘ilgan kun tabriklarini belgilangan vaqtda yuboradigan
-    scheduler yaratadi.
-    """
+    if not groups:
+        logger.debug("Faol eslatma guruhlari topilmadi.")
+        return
 
-    try:
+    for group in groups:
+        await _process_group(bot, group)
 
-        hour, minute = map(
-            int,
-            settings.birthday_reminder_time.split(":"),
-        )
 
-    except (ValueError, AttributeError):
+def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler(timezone=_get_group_timezone(settings.timezone))
 
-        raise ValueError(
-            "BIRTHDAY_REMINDER_TIME noto‘g‘ri. "
-            "Vaqt HH:MM formatida bo‘lishi kerak, masalan: 09:00"
-        ) from None
-
-    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-
-        raise ValueError(
-            "BIRTHDAY_REMINDER_TIME soat 00–23 va minut 00–59 "
-            "oralig‘ida bo‘lishi kerak."
-        )
-
-    timezone = ZoneInfo(settings.timezone)
-
-    scheduler = AsyncIOScheduler(
-        timezone=timezone
-    )
-
+    # Har daqiqada tekshiriladi: har bir guruhning o'z eslatma vaqti va
+    # vaqt zonasi bo'lishi mumkin. Takroriy yuborishdan NotificationLog
+    # himoya qiladi.
     scheduler.add_job(
         send_daily_birthdays,
         trigger="cron",
-        hour=hour,
-        minute=minute,
+        second=0,
         args=[bot],
         id="daily_birthdays",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
-        misfire_grace_time=3600,
+        misfire_grace_time=60,
     )
 
     logger.info(
-        "Tug‘ilgan kun scheduler sozlandi. "
-        "Vaqt: %02d:%02d (%s)",
-        hour,
-        minute,
+        "Scheduler sozlandi: har daqiqada tekshiruv, timezone=%s",
         settings.timezone,
     )
 

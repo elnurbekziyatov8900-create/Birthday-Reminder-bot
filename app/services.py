@@ -1,52 +1,67 @@
 from __future__ import annotations
 
 import calendar
+from dataclasses import dataclass
 from datetime import date, datetime
-from html import escape
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import NotificationLog, Person
+from app.models import Person
+from app.ui import DIVIDER, e, hint, quote, safe
 
 
 settings = get_settings()
 
-
-# ============================================================
-# TELEGRAM PREMIUM CUSTOM EMOJI
-# ============================================================
-# Faqat Telegram tomonidan berilgan haqiqiy custom_emoji_id ishlaydi.
-# Quyidagi ID'lar oldin tekshirilgan. Oddiy Unicode emoji'ni
-# <tg-emoji> ichiga joylash uni Premium emoji'ga aylantirmaydi.
-
-CUSTOM_EMOJI_IDS: dict[str, str] = {
-    "gift": "5199749070830197566",       # 🎁
-    "party": "5436040291507247633",      # 🎉
-    "sparkles": "5472164874886846699",   # ✨
-    "star": "5435957248314579621",       # ⭐
-    "trophy": "5409008750893734809",     # 🏆
-}
-
-
-def premium_emoji(key: str, fallback: str) -> str:
-    """Telegram HTML formatida haqiqiy Custom Emoji qaytaradi."""
-    emoji_id = CUSTOM_EMOJI_IDS.get(key, "").strip()
-
-    if emoji_id.isdigit():
-        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
-
-    return escape(fallback)
+MONTHS_UZ = (
+    "yanvar",
+    "fevral",
+    "mart",
+    "aprel",
+    "may",
+    "iyun",
+    "iyul",
+    "avgust",
+    "sentabr",
+    "oktabr",
+    "noyabr",
+    "dekabr",
+)
 
 
-# ============================================================
-# DATE AND AGE UTILITIES
-# ============================================================
+@dataclass(frozen=True, slots=True)
+class PersonData:
+    """ORM obyektidan mustaqil nusxa.
+
+    Sessiya rollback/commit qilinganda ORM obyektlari "expired" bo'lib
+    qoladi va async rejimda ularning atributlarini o'qish xatolikka olib
+    keladi. Shuning uchun yuborish jarayonida shu nusxadan foydalaniladi.
+    """
+
+    id: int
+    full_name: str
+    birth_date: date
+    photo_file_id: str | None
+    music_file_id: str | None
+
+    @classmethod
+    def from_person(cls, person: Person) -> "PersonData":
+        return cls(
+            id=person.id,
+            full_name=person.full_name,
+            birth_date=person.birth_date,
+            photo_file_id=person.photo_file_id,
+            music_file_id=person.music_file_id,
+        )
+
+
+# ================================================================
+# SANA HISOB-KITOBLARI
+# ================================================================
 
 def birthday_date_for_year(birth_date: date, year: int) -> date:
-    """29-fevral tug'ilgan kunini sozlamadagi siyosat bo'yicha hisoblaydi."""
     if (
         birth_date.month == 2
         and birth_date.day == 29
@@ -54,13 +69,13 @@ def birthday_date_for_year(birth_date: date, year: int) -> date:
     ):
         if settings.leap_day_policy == "february_28":
             return date(year, 2, 28)
+
         return date(year, 3, 1)
 
     return date(year, birth_date.month, birth_date.day)
 
 
 def age_on(birth_date: date, today: date) -> int:
-    """Berilgan sanada inson nechchi yoshga kirganini hisoblaydi."""
     birthday_this_year = birthday_date_for_year(birth_date, today.year)
 
     if today >= birthday_this_year:
@@ -69,123 +84,150 @@ def age_on(birth_date: date, today: date) -> int:
     return today.year - birth_date.year - 1
 
 
+def next_birthday(birth_date: date, today: date) -> date:
+    upcoming = birthday_date_for_year(birth_date, today.year)
+
+    if upcoming < today:
+        upcoming = birthday_date_for_year(birth_date, today.year + 1)
+
+    return upcoming
+
+
 def days_until(birth_date: date, today: date) -> int:
-    """Keyingi tug'ilgan kungacha qolgan kunlar soni."""
-    next_birthday = birthday_date_for_year(birth_date, today.year)
+    return (next_birthday(birth_date, today) - today).days
 
-    if next_birthday < today:
-        next_birthday = birthday_date_for_year(birth_date, today.year + 1)
 
-    return (next_birthday - today).days
+def turning_age(birth_date: date, today: date) -> int:
+    """Navbatdagi tug'ilgan kunda to'ladigan yosh."""
+
+    return next_birthday(birth_date, today).year - birth_date.year
 
 
 def local_today() -> date:
-    """Bot sozlamasidagi vaqt zonasiga mos bugungi sana."""
-    timezone = ZoneInfo(settings.timezone)
-    return datetime.now(timezone).date()
+    return datetime.now(ZoneInfo(settings.timezone)).date()
 
 
-# ============================================================
-# PREMIUM BIRTHDAY GREETING
-# ============================================================
+def format_date_uz(value: date) -> str:
+    return f"{value.day}-{MONTHS_UZ[value.month - 1]}, {value.year}"
 
-def make_greeting(person: Person, today: date) -> str:
-    """
-    Oilaviy guruh uchun premium HTML tabrik tayyorlaydi.
-    Greeting ichidagi bezak emojilari faqat tekshirilgan
-    Telegram Custom Emoji ID'laridan foydalanadi.
-    """
-    name = escape(person.full_name, quote=True)
-    age = age_on(person.birth_date, today)
 
-    gift = premium_emoji("gift", "🎁")
-    party = premium_emoji("party", "🎉")
-    sparkles = premium_emoji("sparkles", "✨")
-    star = premium_emoji("star", "⭐")
-    trophy = premium_emoji("trophy", "🏆")
+def format_day_month_uz(value: date) -> str:
+    return f"{value.day}-{MONTHS_UZ[value.month - 1]}"
 
+
+# ================================================================
+# TABRIK MATNI
+# ================================================================
+
+def _special_wish(age: int) -> str:
     if age <= 12:
-        special_wish = (
+        return (
             "Bolalik olamingiz doimo quvonch va beg'ubor kulguga to'lsin. "
-            "Har bir orzuingiz amalga oshib, yangi kunlar sizga "
-            "qiziqarli kashfiyotlar olib kelsin."
+            "Har bir orzuingiz ushalib, har yangi kun sizga qiziqarli "
+            "kashfiyotlar olib kelsin."
         )
-    elif age <= 19:
-        special_wish = (
+
+    if age <= 19:
+        return (
             "Yoshlik davringiz unutilmas lahzalar, dadil orzular va "
             "yuksak natijalarga boy bo'lsin. Tanlagan yo'lingizda "
             "ishonch bilan olg'a boring."
         )
-    elif age <= 35:
-        special_wish = (
+
+    if age <= 35:
+        return (
             "Oldingizga qo'ygan maqsadlaringiz birin-ketin amalga oshsin. "
             "Har bir yangi kun sizga yangi imkoniyat, xonadoningizga "
             "esa fayz va xotirjamlik olib kelsin."
         )
-    else:
-        special_wish = (
-            "Umringiz uzoq, taningiz sog', ko'nglingiz xotirjam bo'lsin. "
-            "Yaqinlaringiz mehrini, farzandlar kamolini va hayotning "
-            "go'zal onlaridan bahramand bo'lib yuring."
-        )
-
-    poem = (
-        "Yuzingizdan arimasin kulgu, shodlik,"
-        "Har kuningiz olib kelsin baxt, omad."
-        "Ko'nglingizda yashnasin doim ezgulik,"
-        "Umringizga hamroh bo'lsin saodat."
-    )
 
     return (
-        f"{party} <b>BUGUN — QADRLI KUN!</b> {party}\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{sparkles} <b>{name}</b> {sparkles}\n"
-        "\n"
-        f"<b>{age} YOSHINGIZ MUBORAK BO'LSIN!</b>\n"
-        f"{star} Bugun hayotingizning yana bir go'zal sahifasi boshlandi.\n"
-        f"{gift} Tug'ilgan sana: <b>{person.birth_date:%d.%m.%Y}</b>\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{sparkles} <b>ENG EZGU TILAKLAR</b> {sparkles}\n"
-        "\n"
-        "Sizga mustahkam sog'liq, qalb xotirjamligi, oilaviy baxt, "
-        "baraka va barcha ezgu niyatlaringiz ro'yobini tilaymiz.\n"
-        "\n"
-        f"{special_wish}\n"
-        "\n"
-        "Har doim yaqinlaringiz ardog'ida, mehr va e'tibor qurshovida "
-        "bo'ling. Hayotingiz quvonchli xotiralarga boy bo'lsin!\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{star} <b>SIZ UCHUN SAMIMIY TO'RTLIK</b> {star}\n"
-        "\n"
-        f"<blockquote>{escape(poem)}</blockquote>\n"
-        "\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{gift} <b>TAVALLUD KUNINGIZ MUBORAK!</b> {gift}\n"
-        "\n"
-        "<i>Oilamiz nomidan cheksiz mehr va eng yaxshi tilaklar bilan.</i>\n"
-        f"{trophy} <b>Yangi yoshingiz yangi zafarlar olib kelsin!</b>"
+        "Umringiz uzoq, taningiz sog', ko'nglingiz xotirjam bo'lsin. "
+        "Yaqinlaringiz mehrini, farzandlar kamolini ko'rib, hayotning "
+        "go'zal onlaridan bahramand bo'lib yuring."
     )
 
 
-# ============================================================
-# PEOPLE DATABASE QUERIES
-# ============================================================
+POEM_LINES = (
+    "Yuzingizdan arimasin kulgu, shodlik,",
+    "Har kuningiz olib kelsin baxt, omad.",
+    "Ko'nglingizda yashnasin doim ezgulik,",
+    "Umringizga hamroh bo'lsin saodat.",
+)
+
+
+def make_greeting_caption(person: Person | PersonData, today: date) -> str:
+    """Surat ostiga qo'yiladigan qisqa (1024 belgidan kam) sarlavha."""
+
+    age = age_on(person.birth_date, today)
+
+    return (
+        f"{e('confetti')} {e('cake')} {e('confetti')}\n"
+        f"<b>{safe(person.full_name)}</b>\n"
+        f"{e('balloon')} <b>{age} yoshingiz muborak!</b> {e('balloon')}"
+    )
+
+
+def make_greeting(person: Person | PersonData, today: date) -> str:
+    name = safe(person.full_name)
+    age = age_on(person.birth_date, today)
+    poem = "\n".join(safe(line) for line in POEM_LINES)
+
+    return (
+        f"{e('confetti')}{e('party')}{e('cake')}{e('party')}{e('confetti')}\n"
+        f"<b>TAVALLUD KUNINGIZ MUBORAK!</b>\n"
+        f"{DIVIDER}\n"
+        "\n"
+        f"{e('crown')} <b>{name}</b>\n"
+        f"{e('balloon')} Bugun siz <b>{age} yoshga</b> to'ldingiz!\n"
+        f"{e('calendar')} {format_date_uz(person.birth_date)}\n"
+        "\n"
+        f"{e('sparkles')} <b>Eng ezgu tilaklarimiz</b>\n"
+        + quote(
+            "Sizga mustahkam sog'liq, qalb xotirjamligi, oilaviy baxt, "
+            "baraka va barcha ezgu niyatlaringiz ro'yobini tilaymiz.\n\n"
+            f"{_special_wish(age)}\n\n"
+            "Har doim yaqinlaringiz ardog'ida, mehr va e'tibor "
+            "qurshovida bo'ling!"
+        )
+        + "\n"
+        "\n"
+        f"{e('bouquet')} <b>Siz uchun samimiy to'rtlik</b>\n"
+        + quote(f"<i>{poem}</i>")
+        + "\n"
+        "\n"
+        f"{DIVIDER}\n"
+        f"{e('heart_gift')} {hint('Oilamiz nomidan cheksiz mehr bilan')}\n"
+        f"{e('trophy')} <b>Yangi yoshingiz yangi zafarlar olib kelsin!</b> "
+        f"{e('glowing_star')}"
+    )
+
+
+def music_caption(full_name: str) -> str:
+    return (
+        f"{e('notes')} <b>{safe(full_name)}</b> uchun tabrik qo'shig'i "
+        f"{e('heart')}"
+    )
+
+
+# ================================================================
+# MA'LUMOTLAR BAZASI
+# ================================================================
 
 async def list_people(session: AsyncSession) -> list[Person]:
-    """Bazadagi barcha faol insonlarni qaytaradi."""
     result = await session.scalars(
         select(Person)
         .where(Person.is_active.is_(True))
         .order_by(Person.full_name.asc())
     )
+
     return list(result.all())
 
 
-async def birthdays_today(session: AsyncSession, today: date) -> list[Person]:
-    """Bugun tug'ilgan kuni bo'lgan faol insonlarni qaytaradi."""
+async def birthdays_today(
+    session: AsyncSession,
+    today: date,
+) -> list[Person]:
     people = await list_people(session)
 
     return [
@@ -195,45 +237,8 @@ async def birthdays_today(session: AsyncSession, today: date) -> list[Person]:
     ]
 
 
-async def already_notified(
-    session: AsyncSession,
-    person_id: int,
-    year: int,
-) -> bool:
-    """
-    Shu yil uchun muvaffaqiyatli yuborilgan tabrikni tekshiradi.
-    Modeldagi to'g'ri ustun nomi birthday_year.
-    """
-    result = await session.scalar(
-        select(NotificationLog).where(
-            NotificationLog.person_id == person_id,
-            NotificationLog.birthday_year == year,
-            NotificationLog.status == "sent",
-        )
-    )
-    return result is not None
-
-
-# ============================================================
-# BIRTHDAY TABLE
-# ============================================================
-
-def birthday_table(people: list[Person], today: date) -> str:
-    """Tug'ilgan kunlar ro'yxatini HTML formatida chiqaradi."""
-    if not people:
-        return "<b>Hozircha ma'lumot mavjud emas.</b>"
-
-    party = premium_emoji("party", "🎉")
-    gift = premium_emoji("gift", "🎁")
-    star = premium_emoji("star", "⭐")
-
-    lines = [
-        f"{party} <b>OILAVIY TUG'ILGAN KUNLAR</b>",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    sorted_people = sorted(
+def sort_by_upcoming(people: list[Person], today: date) -> list[Person]:
+    return sorted(
         people,
         key=lambda person: (
             days_until(person.birth_date, today),
@@ -241,31 +246,54 @@ def birthday_table(people: list[Person], today: date) -> str:
         ),
     )
 
-    for index, person in enumerate(sorted_people, start=1):
-        name = escape(person.full_name, quote=True)
-        age = age_on(person.birth_date, today)
-        remaining = days_until(person.birth_date, today)
 
-        if remaining == 0:
-            status = f"{party} <b>BUGUN!</b>"
-        elif remaining == 1:
-            status = "Ertaga"
-        else:
-            status = f"{remaining} kun qoldi"
+# ================================================================
+# RO'YXAT DIZAYNI
+# ================================================================
 
-        lines.append(
-            f"{index}. {star} <b>{name}</b>\n"
-            f"   Sana: <code>{person.birth_date:%d.%m.%Y}</code>\n"
-            f"   Yosh: <b>{age}</b> | {status}"
-        )
+def _status_line(person: Person, today: date) -> str:
+    remaining = days_until(person.birth_date, today)
+    turning = turning_age(person.birth_date, today)
 
-    lines.extend(
-        [
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"{gift} Jami: <b>{len(sorted_people)} nafar</b>",
-            f"Bugungi sana: <code>{today:%d.%m.%Y}</code>",
-        ]
+    if remaining == 0:
+        return f"{e('party')} <b>BUGUN!</b> · {turning} yosh"
+
+    if remaining == 1:
+        return f"{e('bell')} <b>Ertaga</b> · {turning} yosh bo'ladi"
+
+    return f"{e('hourglass')} {remaining} kun qoldi · {turning} yosh bo'ladi"
+
+
+def person_entry(person: Person, today: date) -> str:
+    return (
+        f"{e('star')} <b>{safe(person.full_name)}</b>  "
+        f"<code>#{person.id}</code>\n"
+        f"{e('calendar')} {format_day_month_uz(person.birth_date)} "
+        f"<i>({person.birth_date:%d.%m.%Y})</i>\n"
+        f"{_status_line(person, today)}"
     )
 
-    return "\n".join(lines)
+
+def birthday_table(
+    people: list[Person],
+    today: date,
+    heading: str = "OILAVIY TUG'ILGAN KUNLAR",
+) -> str:
+    if not people:
+        return f"{e('mailbox')} <b>Hozircha ma'lumot mavjud emas.</b>"
+
+    sorted_people = sort_by_upcoming(people, today)
+
+    # Har bir yozuv "\n\n" bilan ajratiladi: uzun ro'yxat bo'laklarga
+    # bo'linganda HTML teglar buzilmaydi.
+    blocks = [
+        f"{e('cake')} <b>{safe(heading)}</b>\n{DIVIDER}",
+        *(person_entry(person, today) for person in sorted_people),
+        (
+            f"{DIVIDER}\n"
+            f"{e('people')} Jami: <b>{len(sorted_people)} nafar</b>\n"
+            f"{e('calendar')} Bugun: <b>{format_date_uz(today)}</b>"
+        ),
+    ]
+
+    return "\n\n".join(blocks)

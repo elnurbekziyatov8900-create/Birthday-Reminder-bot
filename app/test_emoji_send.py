@@ -1,52 +1,62 @@
+"""Animatsiyali emojilar va tabrik dizaynini sinab ko'rish.
+
+Ishga tushirish:
+    python -m app.test_emoji_send            # .env dagi ADMIN_USER_IDS ning birinchisiga
+    python -m app.test_emoji_send -100123... # ko'rsatilgan chatga
+
+Eslatma: animatsiyali emojilar faqat bot egasida Telegram Premium bo'lsa
+ko'rinadi, aks holda oddiy emoji ko'rsatiladi.
+"""
+
 import asyncio
+import sys
+from datetime import date
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from app.config import get_settings
+from app.messaging import split_html_text
+from app.services import PersonData, local_today, make_greeting
+from app.ui import EMOJI, e
 
 
-CUSTOM_EMOJI_TEST = (
-    "<b>PREMIUM CUSTOM EMOJI TEST</b>\n\n"
-    '<tg-emoji emoji-id="5199749070830197566">🎁</tg-emoji> Sovg‘a\n'
-    '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji> Bayram\n'
-    '<tg-emoji emoji-id="5472164874886846699">✨</tg-emoji> Yaltirash\n'
-    '<tg-emoji emoji-id="5435957248314579621">⭐️</tg-emoji> Yulduz\n'
-    '<tg-emoji emoji-id="5409008750893734809">🏆</tg-emoji> Kubok\n\n'
-    "<i>Premium Custom Emoji tekshiruvi.</i>"
-)
-
-
-async def main():
+async def main() -> None:
     settings = get_settings()
 
-    # Guruh ID .env faylidan olinadi.
-    chat_id = settings.target_group_id
-
-    if not chat_id:
-        print("XATOLIK: TARGET_GROUP_ID topilmadi!")
-        print("app/.env emas, loyiha asosiy .env faylini tekshiring.")
+    if len(sys.argv) > 1:
+        chat_id = int(sys.argv[1])
+    elif settings.admin_ids:
+        chat_id = min(settings.admin_ids)
+    else:
+        print("XATOLIK: chat ID ko'rsatilmagan va ADMIN_USER_IDS bo'sh.")
         return
+
+    gallery = " ".join(e(key) for key in EMOJI)
+    today = local_today()
+    sample = PersonData(
+        id=0,
+        full_name="Namuna Inson",
+        birth_date=date(today.year - 25, today.month, min(today.day, 28)),
+        photo_file_id=None,
+        music_file_id=None,
+    )
 
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML
-        )
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=CUSTOM_EMOJI_TEST
-        )
+        await bot.send_message(chat_id, f"<b>Animatsiyali emojilar</b>\n\n{gallery}")
 
-        print("MUVAFFAQIYATLI!")
-        print(f"Guruh ID: {chat_id}")
-        print(f"Xabar ID: {sent.message_id}")
+        for chunk in split_html_text(make_greeting(sample, today)):
+            await bot.send_message(chat_id, chunk)
 
-    except Exception as error:
+        print(f"MUVAFFAQIYATLI! Chat ID: {chat_id}")
+
+    except Exception as error:  # noqa: BLE001
         print(f"XATOLIK: {type(error).__name__}: {error}")
 
     finally:

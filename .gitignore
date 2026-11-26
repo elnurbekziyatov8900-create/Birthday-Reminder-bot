@@ -1,9 +1,17 @@
-@'
+# Maxfiy sozlamalar
 .env
+
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# IDE
 .idea/
 .vscode/
-'@ | Set-Content -Path .gitignore -Encoding utf8
+
+# Ma'lumotlar bazasi zaxiralari (shaxsiy ma'lumotlar)
+*.dump
+*.sql.gz
+backups/
